@@ -21,3 +21,4 @@ werkzeug==2.0.2
 itsdangerous==2.0.1
 aiogram>=3.22,<4
 Telethon>=1.42,<2
+httpx>=0.28,<1
