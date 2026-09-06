@@ -9,13 +9,15 @@ services:
         sync: false
       - key: TELEGRAM_API_HASH
         sync: false
-      - key: TELEGRAM_PHONE_NUMBER
-        sync: false
       - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_SESSION_STRING
         sync: false
       - key: TELEGRAM_ALLOWED_USER_IDS
         sync: false
       - key: TELEGRAM_DESTINATION
+        sync: false
+      - key: TELEGRAM_USER_DESTINATIONS
         sync: false
       - key: TELEGRAM_BRANDING
         value: "@hjgroups_1"
