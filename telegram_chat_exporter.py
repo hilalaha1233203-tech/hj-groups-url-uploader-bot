@@ -19,6 +19,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError
 
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
@@ -26,6 +27,7 @@ API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 PHONE_NUMBER = os.getenv("TELEGRAM_PHONE_NUMBER", "")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "telegram_user_session")
+SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING", "").strip()
 ALLOWED_USER_IDS = {
     int(value.strip()) for value in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").split(",")
     if value.strip().isdigit() and int(value.strip()) > 0
@@ -37,7 +39,6 @@ MAX_BULK_MESSAGES = max(1, int(os.getenv("TELEGRAM_MAX_BULK_MESSAGES", "500")))
 MAX_ACTIVE_JOBS = max(1, int(os.getenv("TELEGRAM_MAX_ACTIVE_JOBS", "1")))
 STATE_FILE = Path(os.getenv("TELEGRAM_STATE_FILE", "telegram_media_state.json"))
 
-# Optional mapping: TELEGRAM_USER_DESTINATIONS=123:@dest|456:-1001234567890
 ENV_DESTINATIONS: dict[str, str] = {}
 for item in os.getenv("TELEGRAM_USER_DESTINATIONS", "").split("|"):
     if ":" in item:
@@ -45,7 +46,13 @@ for item in os.getenv("TELEGRAM_USER_DESTINATIONS", "").split("|"):
         if uid.strip().isdigit() and destination.strip():
             ENV_DESTINATIONS[uid.strip()] = destination.strip()
 
-user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+# StringSession is recommended for hosted deployment because it avoids storing
+# a .session file on the server. A file session remains supported for local use.
+if SESSION_STRING:
+    user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+else:
+    user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_ACTIVE_JOBS)
@@ -119,8 +126,7 @@ def media_kind(message: Any) -> str | None:
     if document is None:
         return "other"
     mime = (getattr(document, "mime_type", "") or "").lower()
-    attrs = getattr(document, "attributes", []) or []
-    names = {type(attr).__name__ for attr in attrs}
+    names = {type(attr).__name__ for attr in (getattr(document, "attributes", []) or [])}
     if "DocumentAttributeAudio" in names or mime.startswith("audio/"):
         return "audio"
     if "DocumentAttributeVideo" in names or mime.startswith("video/"):
@@ -245,9 +251,6 @@ def track_delete_task(task: asyncio.Task) -> None:
 
 
 async def send_to_destination(message: Any, destination: str) -> Any:
-    # Telethon can reuse the existing Telegram media reference, avoiding a
-    # local download/re-upload in the normal case. Do not force_document so
-    # photos/audio/video keep their native Telegram media type.
     return await with_flood_wait(lambda: user_client.send_file(
         destination, message.media, caption=caption_for(message)
     ))
@@ -283,8 +286,7 @@ async def process_job(job: SelectionJob, status_message: Message) -> None:
         minutes = BOT_DELETE_SECONDS // 60
         await status_message.edit_text(
             f"✅ Completed\n\nSent: {done}\nFailed: {failed}\n\n"
-            f"Destination: {job.destination}\n"
-            f"Bot-chat copies auto-delete after {minutes} minutes."
+            f"Destination: {job.destination}\nBot-chat copies auto-delete after {minutes} minutes."
         )
 
 
@@ -298,9 +300,8 @@ async def create_job_from_messages(user_id: int, source: Any, messages: list[Any
         return
     candidates = {message.id: message for message in messages}
     JOBS[user_id] = SelectionJob(
-        owner_id=user_id, source=source, candidates=candidates,
-        destination=destination, selected=set(candidates) if len(candidates) == 1 else set(),
-        status_message_id=status.message_id,
+        owner_id=user_id, source=source, candidates=candidates, destination=destination,
+        selected=set(candidates) if len(candidates) == 1 else set(), status_message_id=status.message_id,
     )
     await status.edit_text(summary(messages), reply_markup=scan_keyboard(user_id))
 
@@ -549,9 +550,12 @@ async def noop_callback(callback: CallbackQuery) -> None:
 
 
 async def run_telethon() -> None:
-    # First login creates the session interactively. A securely stored session
-    # can then be supplied to the hosting runtime; never commit it to GitHub.
-    await user_client.start(phone=PHONE_NUMBER)
+    if SESSION_STRING:
+        await user_client.start()
+    else:
+        await user_client.start(phone=PHONE_NUMBER)
+    if not await user_client.is_user_authorized():
+        raise RuntimeError("Telethon account is not authorized. Create a session first.")
     me = await user_client.get_me()
     print(f"Telethon connected as {getattr(me, 'username', None) or me.id}")
     await user_client.run_until_disconnected()
@@ -563,8 +567,10 @@ async def run_bot() -> None:
 
 
 async def main() -> None:
-    if not API_ID or not API_HASH or not PHONE_NUMBER or not BOT_TOKEN:
-        raise RuntimeError("Set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE_NUMBER and TELEGRAM_BOT_TOKEN.")
+    if not API_ID or not API_HASH or not BOT_TOKEN:
+        raise RuntimeError("Set TELEGRAM_API_ID, TELEGRAM_API_HASH and TELEGRAM_BOT_TOKEN.")
+    if not SESSION_STRING and not PHONE_NUMBER:
+        raise RuntimeError("Set TELEGRAM_SESSION_STRING for hosting or TELEGRAM_PHONE_NUMBER for local first login.")
     if not ALLOWED_USER_IDS:
         raise RuntimeError("Set TELEGRAM_ALLOWED_USER_IDS to at least one Telegram user ID.")
     telethon_task = asyncio.create_task(run_telethon(), name="telethon-user-client")
