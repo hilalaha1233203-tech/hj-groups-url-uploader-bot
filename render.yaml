@@ -29,3 +29,11 @@ services:
         value: "1"
       - key: TELEGRAM_SESSION_NAME
         value: "telegram_user_session"
+      - key: PLAYBOOK_API_TOKEN
+        sync: false
+      - key: PLAYBOOK_ORG_SLUG
+        sync: false
+      - key: PLAYBOOK_API_BASE_URL
+        value: "https://api.playbook.com/v1"
+      - key: PLAYBOOK_HTTP_TIMEOUT
+        value: "120"
