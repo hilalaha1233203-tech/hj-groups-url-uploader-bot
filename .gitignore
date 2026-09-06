@@ -1,0 +1,13 @@
+# Telegram secrets/session
+.env
+.env.*
+!.env.telegram-media.example
+*.session
+*.session-journal
+
+# Local runtime state / media
+telegram_media_state.json
+downloads/
+exports/
+__pycache__/
+*.py[cod]
