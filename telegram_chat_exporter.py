@@ -1,34 +1,8 @@
-"""
-HJ GROUPS Telegram Media Collector / Forwarder
+"""HJ GROUPS Telegram Media Collector / Forwarder.
 
-Architecture
-------------
-* aiogram Bot API: UI, commands and inline buttons.
-* Telethon user client: reads chats that the logged-in personal account can access
-  and sends media to the configured destination and the bot chat.
-* Both clients run concurrently on one asyncio event loop.
-
-Supported workflow
-------------------
-1. Send a Telegram message link to the bot.
-2. Or send a chat reference plus a message range, e.g. /range @channel 25 100.
-3. The bot scans the requested messages and shows media-type totals.
-4. Choose Audio / Video / Photo / Document / All / Select individually.
-5. After confirmation, media is sent to the configured destination and also to
-   the bot chat. Bot-chat copies are automatically deleted after 60 minutes.
-6. Captions contain the original caption (when present), file size, and
-   @hjgroups_1 on the last line.
-
-Important limitations
----------------------
-* The personal Telethon account must have access to the source chat.
-* Protected content / chats that prohibit forwarding or saving can fail by design.
-* Direct Telegram MTProto sending is used for large files; this avoids the
-  normal Bot API 50 MB upload limit. Telegram's current MTProto upload limits
-  are determined by the account's current Telegram configuration (including
-  Premium). Do not treat 4 GB as a universal guarantee.
-* No flood-limit bypass is attempted. FloodWait is respected and the job waits.
-* Real credentials and the Telethon .session file must never be committed to GitHub.
+Uses aiogram for the bot UI and Telethon (MTProto) for reading/sending media.
+The Telethon account must legitimately have access to the source and destination.
+No flood-limit bypassing is attempted.
 """
 
 from __future__ import annotations
@@ -39,7 +13,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -47,46 +21,61 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
 
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 PHONE_NUMBER = os.getenv("TELEGRAM_PHONE_NUMBER", "")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "telegram_user_session")
 
-# Comma-separated Telegram user IDs allowed to use the bot.
 ALLOWED_USER_IDS = {
-    int(x.strip())
-    for x in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "0").split(",")
-    if x.strip().isdigit() and int(x.strip()) > 0
+    int(value.strip())
+    for value in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").split(",")
+    if value.strip().isdigit() and int(value.strip()) > 0
 }
 
-DEFAULT_DESTINATION = os.getenv("TELEGRAM_DESTINATION", "")
-BRANDING = os.getenv("TELEGRAM_BRANDING", "@hjgroups_1")
-BOT_DELETE_SECONDS = int(os.getenv("TELEGRAM_BOT_DELETE_SECONDS", "3600"))
-MAX_BULK_MESSAGES = int(os.getenv("TELEGRAM_MAX_BULK_MESSAGES", "500"))
+DEFAULT_DESTINATION = os.getenv("TELEGRAM_DESTINATION", "").strip()
+BRANDING = os.getenv("TELEGRAM_BRANDING", "@hjgroups_1").strip()
+BOT_DELETE_SECONDS = max(0, int(os.getenv("TELEGRAM_BOT_DELETE_SECONDS", "3600")))
+MAX_BULK_MESSAGES = max(1, int(os.getenv("TELEGRAM_MAX_BULK_MESSAGES", "500")))
+MAX_ACTIVE_JOBS = max(1, int(os.getenv("TELEGRAM_MAX_ACTIVE_JOBS", "1")))
 STATE_FILE = Path(os.getenv("TELEGRAM_STATE_FILE", "telegram_media_state.json"))
-SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "telegram_user_session")
-MAX_ACTIVE_JOBS = int(os.getenv("TELEGRAM_MAX_ACTIVE_JOBS", "1"))
-JOB_SEMAPHORE = asyncio.Semaphore(MAX_ACTIVE_JOBS)
+
+# Optional persistent-per-process mapping. Format:
+# TELEGRAM_USER_DESTINATIONS=123456:@destination|789012:-1001234567890
+ENV_DESTINATIONS: dict[str, str] = {}
+for item in os.getenv("TELEGRAM_USER_DESTINATIONS", "").split("|"):
+    if ":" in item:
+        uid, destination = item.split(":", 1)
+        if uid.strip().isdigit() and destination.strip():
+            ENV_DESTINATIONS[uid.strip()] = destination.strip()
 
 user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+JOB_SEMAPHORE = asyncio.Semaphore(MAX_ACTIVE_JOBS)
+DELETE_TASKS: set[asyncio.Task] = set()
 
 
 @dataclass
 class SelectionJob:
     owner_id: int
     source: Any
-    message_ids: list[int]
     candidates: dict[int, Any]
     destination: str
-    bot_message_id: int | None = None
-    selected: set[int] | None = None
+    selected: set[int]
+    status_message_id: int | None = None
 
 
 JOBS: dict[int, SelectionJob] = {}
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 def is_allowed(user_id: int | None) -> bool:
     return bool(user_id and user_id in ALLOWED_USER_IDS)
 
@@ -97,19 +86,27 @@ def load_state() -> dict[str, str]:
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
-    except Exception:
+    except (OSError, ValueError, TypeError):
         return {}
 
 
 def save_state(data: dict[str, str]) -> None:
-    STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    try:
+        STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError as exc:
+        # Render and other ephemeral hosts can have read-only/ephemeral storage.
+        print(f"Could not persist destination state: {exc}")
 
 
 USER_STATE = load_state()
 
 
 def get_destination(user_id: int) -> str:
-    return USER_STATE.get(str(user_id), DEFAULT_DESTINATION).strip()
+    return (
+        USER_STATE.get(str(user_id))
+        or ENV_DESTINATIONS.get(str(user_id))
+        or DEFAULT_DESTINATION
+    ).strip()
 
 
 def set_destination(user_id: int, destination: str) -> None:
@@ -120,11 +117,10 @@ def set_destination(user_id: int, destination: str) -> None:
 def format_size(size: int | None) -> str:
     if not size:
         return "Unknown"
-    units = ("B", "KB", "MB", "GB", "TB")
     value = float(size)
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
     return "Unknown"
 
@@ -134,21 +130,24 @@ def media_kind(message: Any) -> str | None:
     if media is None:
         return None
 
+    if type(media).__name__ == "MessageMediaPhoto":
+        return "photo"
+
     document = getattr(media, "document", None)
+    if document is None:
+        return "other"
+
     mime = (getattr(document, "mime_type", "") or "").lower()
     attrs = getattr(document, "attributes", []) or []
+    attr_names = {type(attr).__name__ for attr in attrs}
 
-    has_audio = any(type(a).__name__ == "DocumentAttributeAudio" for a in attrs)
-    has_video = any(type(a).__name__ == "DocumentAttributeVideo" for a in attrs)
-    if has_audio or mime.startswith("audio/"):
+    if "DocumentAttributeAudio" in attr_names or mime.startswith("audio/"):
         return "audio"
-    if has_video or mime.startswith("video/"):
+    if "DocumentAttributeVideo" in attr_names or mime.startswith("video/"):
         return "video"
-    if mime.startswith("image/") or type(media).__name__ == "MessageMediaPhoto":
+    if mime.startswith("image/"):
         return "photo"
-    if document is not None:
-        return "document"
-    return "other"
+    return "document"
 
 
 def media_size(message: Any) -> int:
@@ -157,124 +156,153 @@ def media_size(message: Any) -> int:
     return int(getattr(document, "size", 0) or 0)
 
 
-def media_name(message: Any) -> str:
-    media = getattr(message, "media", None)
-    document = getattr(media, "document", None)
-    for attr in getattr(document, "attributes", []) or []:
-        filename = getattr(attr, "file_name", None)
-        if filename:
-            return filename
-    return f"telegram_{message.id}.{media_kind(message) or 'media'}"
-
-
 def caption_for(message: Any) -> str:
     original = (getattr(message, "message", None) or "").strip()
-    size = format_size(media_size(message))
     parts = []
     if original:
         parts.append(original)
-    parts.append(f"📦 File Size: {size}")
-    parts.append(BRANDING)
-    return "\n\n".join(parts)[:1024]
+    parts.append(f"📦 File Size: {format_size(media_size(message))}")
+    if BRANDING:
+        parts.append(BRANDING)
+    # Telegram media captions are limited; preserve the beginning of the
+    # original caption and always keep the size/branding footer.
+    caption = "\n\n".join(parts)
+    return caption[:1024]
 
 
-def link_to_source(link: str) -> tuple[str, int]:
-    """Parse common t.me message links into (peer reference, message id)."""
-    value = link.strip()
-    pattern = re.compile(r"https?://t\.me/(?:c/(\d+)|([A-Za-z0-9_]+)/)(\d+)(?:\?.*)?$")
+def parse_message_link(value: str) -> tuple[str, int]:
+    """Return (Telethon peer reference, message id) for common t.me links."""
+    value = value.strip()
+    pattern = re.compile(
+        r"^https?://(?:www\.)?t\.me/(?:c/(\d+)|([A-Za-z0-9_]{3,}))/([0-9]+)(?:\?.*)?$"
+    )
     match = pattern.match(value)
     if not match:
-        raise ValueError("Invalid Telegram message link. Use a t.me message link.")
+        raise ValueError("Invalid Telegram message link. Use a t.me/.../message_id link.")
 
-    private_id, username, message_id_text = match.groups()
-    message_id = int(message_id_text)
+    private_id, username, message_id = match.groups()
     peer = f"-100{private_id}" if private_id else f"@{username}"
-    return peer, message_id
+    return peer, int(message_id)
 
 
-def build_scan_keyboard(job_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🎵 Audio", callback_data=f"pick:{job_id}:audio"), InlineKeyboardButton(text="🎬 Video", callback_data=f"pick:{job_id}:video")],
-            [InlineKeyboardButton(text="📷 Photos", callback_data=f"pick:{job_id}:photo"), InlineKeyboardButton(text="📄 Documents", callback_data=f"pick:{job_id}:document")],
-            [InlineKeyboardButton(text="⬇️ All files", callback_data=f"pick:{job_id}:all")],
-            [InlineKeyboardButton(text="☑️ Select individually", callback_data=f"select:{job_id}")],
-            [InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job_id}")],
-        ]
-    )
+async def with_flood_wait(factory: Callable[[], Awaitable[Any]]) -> Any:
+    """Execute an API operation and respect Telegram FloodWait responses."""
+    while True:
+        try:
+            return await factory()
+        except FloodWaitError as exc:
+            seconds = max(1, int(getattr(exc, "seconds", 1)))
+            print(f"Telegram FloodWait: waiting {seconds}s")
+            await asyncio.sleep(seconds + 1)
 
 
-def build_confirm_keyboard(job_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Confirm", callback_data=f"confirm:{job_id}")],
-            [InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job_id}")],
-        ]
-    )
+async def resolve_source_and_message(link: str) -> tuple[Any, Any]:
+    peer, message_id = parse_message_link(link)
+    source = await user_client.get_entity(peer)
+    message = await user_client.get_messages(source, ids=message_id)
+    if not message:
+        raise ValueError("Message was not found or is not accessible by the Telethon account.")
+    return source, message
 
 
-def build_individual_keyboard(job: SelectionJob) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    selected = job.selected or set()
-    for mid, msg in list(job.candidates.items())[:50]:
-        mark = "☑️" if mid in selected else "⬜"
-        label = f"{mark} #{mid} {media_kind(msg) or 'media'} {format_size(media_size(msg))}"
-        rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"toggle:{id(job)}:{mid}")])
-    rows.append([InlineKeyboardButton(text="✅ Download selected", callback_data=f"confirm_select:{id(job)}")])
-    rows.append([InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel_obj:{id(job)}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+async def scan_range(source: Any, start_id: int, end_id: int) -> list[Any]:
+    if start_id <= 0 or end_id <= 0:
+        raise ValueError("Message IDs must be positive.")
+    if end_id < start_id:
+        raise ValueError("End message ID must be greater than or equal to start ID.")
+    if end_id - start_id + 1 > MAX_BULK_MESSAGES:
+        raise ValueError(f"Maximum range is {MAX_BULK_MESSAGES} messages per job.")
+
+    messages = await user_client.get_messages(source, ids=list(range(start_id, end_id + 1)))
+    return [message for message in messages if message and getattr(message, "media", None)]
 
 
-def scan_summary(messages: list[Any]) -> str:
+def summary(messages: list[Any]) -> str:
     counts = {"audio": 0, "video": 0, "photo": 0, "document": 0, "other": 0}
-    total = 0
-    for msg in messages:
-        kind = media_kind(msg)
-        if kind:
-            counts[kind] += 1
-            total += media_size(msg)
+    total_size = 0
+    for message in messages:
+        kind = media_kind(message) or "other"
+        counts[kind] = counts.get(kind, 0) + 1
+        total_size += media_size(message)
+
     return (
         "🔎 Scan Complete\n\n"
         f"🎵 Audio: {counts['audio']}\n"
-        f"🎬 Videos: {counts['video']}\n"
+        f"🎬 Video: {counts['video']}\n"
         f"📷 Photos: {counts['photo']}\n"
         f"📄 Documents: {counts['document']}\n"
-        f"📦 Total size: {format_size(total)}\n\n"
+        f"📦 Total size: {format_size(total_size)}\n\n"
         "Choose what to process:"
     )
 
 
-async def resolve_message_link(link: str) -> tuple[Any, Any]:
-    peer, message_id = link_to_source(link)
-    entity = await user_client.get_entity(peer)
-    message = await user_client.get_messages(entity, ids=message_id)
-    if not message:
-        raise ValueError("Message was not found or is not accessible by the user account.")
-    return entity, message
+def scan_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎵 Audio", callback_data=f"pick:{user_id}:audio"),
+            InlineKeyboardButton(text="🎬 Video", callback_data=f"pick:{user_id}:video"),
+        ],
+        [
+            InlineKeyboardButton(text="📷 Photos", callback_data=f"pick:{user_id}:photo"),
+            InlineKeyboardButton(text="📄 Documents", callback_data=f"pick:{user_id}:document"),
+        ],
+        [InlineKeyboardButton(text="⬇️ All files", callback_data=f"pick:{user_id}:all")],
+        [InlineKeyboardButton(text="☑️ Select individually", callback_data=f"individual:{user_id}")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{user_id}")],
+    ])
 
 
-async def scan_messages(source: Any, start_id: int, end_id: int) -> list[Any]:
-    if end_id < start_id:
-        raise ValueError("End message ID must be greater than or equal to start ID.")
-    if end_id - start_id + 1 > MAX_BULK_MESSAGES:
-        raise ValueError(f"Range is too large. Maximum is {MAX_BULK_MESSAGES} messages per job.")
-    messages = await user_client.get_messages(source, ids=list(range(start_id, end_id + 1)))
-    return [m for m in messages if m and getattr(m, "media", None)]
+def confirm_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Confirm", callback_data=f"confirm:{user_id}")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{user_id}")],
+    ])
 
 
-async def run_with_flood_wait(coro_factory):
-    """Respect Telegram FloodWait instead of trying to bypass it."""
-    while True:
-        try:
-            return await coro_factory()
-        except FloodWaitError as exc:
-            wait_seconds = int(getattr(exc, "seconds", 1))
-            print(f"Telegram FloodWait: sleeping {wait_seconds}s")
-            await asyncio.sleep(wait_seconds + 1)
+def individual_keyboard(job: SelectionJob) -> InlineKeyboardMarkup:
+    """Show up to 50 inline choices; /select can handle larger scanned ranges."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for message_id, message in list(job.candidates.items())[:50]:
+        mark = "☑️" if message_id in job.selected else "⬜"
+        label = f"{mark} #{message_id} {media_kind(message) or 'media'} {format_size(media_size(message))}"
+        rows.append([
+            InlineKeyboardButton(
+                text=label[:60],
+                callback_data=f"toggle:{job.owner_id}:{message_id}",
+            )
+        ])
+
+    if len(job.candidates) > 50:
+        rows.append([InlineKeyboardButton(
+            text="ℹ️ More files: use /select 101,102,...",
+            callback_data=f"noop:{job.owner_id}",
+        )])
+    rows.append([InlineKeyboardButton(text="✅ Continue", callback_data=f"individual_confirm:{job.owner_id}")])
+    rows.append([InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job.owner_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def send_media_to_destination(message: Any, destination: str) -> Any:
-    return await run_with_flood_wait(
+async def schedule_delete(sent_message: Any) -> None:
+    if BOT_DELETE_SECONDS <= 0:
+        return
+    await asyncio.sleep(BOT_DELETE_SECONDS)
+    try:
+        await with_flood_wait(
+            lambda: user_client.delete_messages(sent_message.peer_id, [sent_message.id])
+        )
+    except Exception as exc:
+        print(f"Bot-chat auto-delete failed: {type(exc).__name__}: {exc}")
+
+
+def track_delete_task(task: asyncio.Task) -> None:
+    DELETE_TASKS.add(task)
+    task.add_done_callback(DELETE_TASKS.discard)
+
+
+async def send_to_destination(message: Any, destination: str) -> Any:
+    # Passing message.media lets Telethon use Telegram's existing media object
+    # rather than downloading to disk first in the normal case.
+    return await with_flood_wait(
         lambda: user_client.send_file(
             destination,
             message.media,
@@ -284,9 +312,10 @@ async def send_media_to_destination(message: Any, destination: str) -> Any:
     )
 
 
-async def send_media_to_bot_chat(message: Any, bot_chat_id: int) -> Any:
-    """Send the large-file-capable copy to the bot conversation via MTProto."""
-    sent = await run_with_flood_wait(
+async def send_to_bot_chat(message: Any, bot_chat_id: int) -> Any:
+    # This is intentionally sent through the Telethon user account so large
+    # files are not constrained by the normal Bot API upload limit.
+    sent = await with_flood_wait(
         lambda: user_client.send_file(
             bot_chat_id,
             message.media,
@@ -294,274 +323,369 @@ async def send_media_to_bot_chat(message: Any, bot_chat_id: int) -> Any:
             force_document=True,
         )
     )
-    asyncio.create_task(delete_later(sent))
+    if BOT_DELETE_SECONDS > 0:
+        task = asyncio.create_task(schedule_delete(sent))
+        track_delete_task(task)
     return sent
 
 
-async def delete_later(message: Any) -> None:
-    await asyncio.sleep(BOT_DELETE_SECONDS)
-    try:
-        await run_with_flood_wait(lambda: user_client.delete_messages(message.peer_id, [message.id]))
-    except Exception as exc:
-        print(f"Auto-delete failed: {type(exc).__name__}: {exc}")
-
-
-async def process_job(job: SelectionJob, bot_chat_id: int, status_message: Message) -> None:
+async def process_job(job: SelectionJob, status_message: Message) -> None:
     async with JOB_SEMAPHORE:
-        selected_ids = job.selected or set(job.candidates.keys())
-        messages = [job.candidates[mid] for mid in job.candidates if mid in selected_ids]
-        total = len(messages)
+        selected = [
+            job.candidates[message_id]
+            for message_id in job.candidates
+            if message_id in job.selected
+        ]
+        total = len(selected)
         done = 0
+        failed = 0
+
         await status_message.edit_text(f"⏳ Processing 0/{total} files...")
 
-        for message in messages:
+        for message in selected:
+            message_id = getattr(message, "id", "?")
             try:
-                await send_media_to_destination(message, job.destination)
-                await send_media_to_bot_chat(message, bot_chat_id)
+                await send_to_destination(message, job.destination)
+                await send_to_bot_chat(message, job.owner_id)
                 done += 1
-                await status_message.edit_text(f"⏳ Processing {done}/{total} files...")
             except RPCError as exc:
-                print(f"Media {getattr(message, 'id', '?')} failed: {type(exc).__name__}: {exc}")
-                await status_message.edit_text(
-                    f"⚠️ Processed {done}/{total}. Message {getattr(message, 'id', '?')} failed: {type(exc).__name__}"
-                )
+                failed += 1
+                print(f"Message {message_id} failed: {type(exc).__name__}: {exc}")
+            except Exception as exc:
+                failed += 1
+                print(f"Message {message_id} failed: {type(exc).__name__}: {exc}")
 
-        await status_message.edit_text(f"✅ Completed: {done}/{total} files\n\nDestination: {job.destination}")
+            await status_message.edit_text(
+                f"⏳ Processing {done + failed}/{total} files...\n"
+                f"✅ Sent: {done}\n⚠️ Failed: {failed}"
+            )
+
+        await status_message.edit_text(
+            f"✅ Completed\n\n"
+            f"Sent: {done}\n"
+            f"Failed: {failed}\n\n"
+            f"Destination: {job.destination}\n"
+            f"Bot-chat copies auto-delete after {BOT_DELETE_SECONDS // 60} minutes."
+        )
 
 
+async def create_job_from_messages(user_id: int, source: Any, messages: list[Any], status: Message) -> None:
+    if not messages:
+        await status.edit_text("No downloadable media messages were found.")
+        return
+
+    destination = get_destination(user_id)
+    if not destination:
+        await status.edit_text("Set a destination first with /setdestination <chat_id_or_username>")
+        return
+
+    candidates = {message.id: message for message in messages}
+    # Single-link jobs default to the single file. Range jobs default to none,
+    # requiring the user to choose a category or individual files.
+    selected = set(candidates) if len(candidates) == 1 else set()
+    JOBS[user_id] = SelectionJob(
+        owner_id=user_id,
+        source=source,
+        candidates=candidates,
+        destination=destination,
+        selected=selected,
+        status_message_id=status.message_id,
+    )
+    await status.edit_text(summary(messages), reply_markup=scan_keyboard(user_id))
+
+
+# ---------------------------------------------------------------------------
+# Bot commands
+# ---------------------------------------------------------------------------
 @dp.message(CommandStart())
 async def start_handler(message: Message) -> None:
-    if not is_allowed(message.from_user.id if message.from_user else None):
+    user_id = message.from_user.id if message.from_user else None
+    if not is_allowed(user_id):
         return
-    destination = get_destination(message.from_user.id)
+    destination = get_destination(user_id)
     await message.answer(
         "HJ GROUPS Media Collector\n\n"
-        "Send a Telegram message link to scan one message.\n"
-        "Use /range <chat> <start_id> <end_id> for bulk selection.\n\n"
+        "Send a Telegram message link to scan one media message.\n"
+        f"For bulk use: /range <chat_or_link> <start_id> <end_id>\n\n"
         f"Destination: {destination or 'not configured'}\n\n"
         "Commands:\n"
         "/setdestination <chat_id_or_username>\n"
-        "/range <chat> <start_id> <end_id>\n"
+        "/range <chat_or_message_link> <start_id> <end_id>\n"
+        "/select <message_id,message_id,...>\n"
         "/cancel"
     )
 
 
 @dp.message(Command("setdestination"))
 async def set_destination_handler(message: Message) -> None:
-    if not is_allowed(message.from_user.id if message.from_user else None):
+    user_id = message.from_user.id if message.from_user else None
+    if not is_allowed(user_id):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2:
         await message.answer("Usage: /setdestination @channel_or_chat_id")
         return
-    destination = parts[1].strip()
-    set_destination(message.from_user.id, destination)
-    await message.answer(f"✅ Destination saved: {destination}")
+    set_destination(user_id, parts[1].strip())
+    await message.answer(f"✅ Destination saved: {parts[1].strip()}")
 
 
 @dp.message(Command("cancel"))
 async def cancel_handler(message: Message) -> None:
-    if not is_allowed(message.from_user.id if message.from_user else None):
+    user_id = message.from_user.id if message.from_user else None
+    if not is_allowed(user_id):
         return
-    JOBS.pop(message.from_user.id, None)
+    JOBS.pop(user_id, None)
     await message.answer("❌ Current job cancelled.")
 
 
 @dp.message(Command("range"))
 async def range_handler(message: Message) -> None:
-    if not is_allowed(message.from_user.id if message.from_user else None):
+    user_id = message.from_user.id if message.from_user else None
+    if not is_allowed(user_id):
         return
+
     parts = (message.text or "").split()
     if len(parts) != 4:
-        await message.answer("Usage: /range @channel_or_chat_id START_ID END_ID\nExample: /range @mychannel 25 100")
+        await message.answer("Usage: /range @channel_or_link START_ID END_ID")
         return
-    destination = get_destination(message.from_user.id)
+
+    destination = get_destination(user_id)
     if not destination:
-        await message.answer("Set a destination first with /setdestination")
+        await message.answer("Set a destination first with /setdestination <chat_id_or_username>")
         return
+
     try:
-        source = await user_client.get_entity(parts[1])
+        source_ref = parts[1]
+        if source_ref.startswith("http"):
+            peer, _ = parse_message_link(source_ref)
+            source = await user_client.get_entity(peer)
+        else:
+            source = await user_client.get_entity(source_ref)
+
         start_id = int(parts[2])
         end_id = int(parts[3])
         status = await message.answer("🔎 Scanning messages...")
-        media_messages = await scan_messages(source, start_id, end_id)
-        if not media_messages:
-            await status.edit_text("No downloadable media messages were found in that range.")
-            return
-        job = SelectionJob(
-            owner_id=message.from_user.id,
-            source=source,
-            message_ids=[m.id for m in media_messages],
-            candidates={m.id: m for m in media_messages},
-            destination=destination,
-            bot_message_id=status.message_id,
-            selected=set(),
-        )
-        JOBS[message.from_user.id] = job
-        await status.edit_text(scan_summary(media_messages), reply_markup=build_scan_keyboard(message.from_user.id))
+        messages = await scan_range(source, start_id, end_id)
+        await create_job_from_messages(user_id, source, messages, status)
     except (ValueError, RPCError) as exc:
         await message.answer(f"Could not scan range: {exc}")
 
 
+@dp.message(Command("select"))
+async def select_command(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    if not is_allowed(user_id):
+        return
+    job = JOBS.get(user_id)
+    if not job:
+        await message.answer("No active scan. Send a link or use /range first.")
+        return
+
+    raw = (message.text or "").split(maxsplit=1)
+    if len(raw) != 2:
+        await message.answer("Usage: /select 25,31,44")
+        return
+
+    try:
+        ids = {int(value.strip()) for value in raw[1].split(",") if value.strip()}
+    except ValueError:
+        await message.answer("Message IDs must be comma-separated numbers.")
+        return
+
+    missing = ids - set(job.candidates)
+    if missing:
+        await message.answer("These IDs were not in the current scan: " + ", ".join(map(str, sorted(missing)[:20])))
+        return
+
+    job.selected = ids
+    total_size = sum(media_size(job.candidates[mid]) for mid in ids)
+    await message.answer(
+        f"Selected {len(ids)} file(s).\n"
+        f"Total size: {format_size(total_size)}\n\n"
+        f"Destination: {job.destination}\n\nConfirm?",
+        reply_markup=confirm_keyboard(user_id),
+    )
+
+
 @dp.message(F.text)
-async def text_handler(message: Message) -> None:
-    if not is_allowed(message.from_user.id if message.from_user else None):
+async def link_handler(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    if not is_allowed(user_id):
         return
+
     text = (message.text or "").strip()
-    if not text.startswith("http") or "t.me/" not in text:
-        await message.answer("Send a Telegram message link, or use /range <chat> <start> <end>.")
+    if not re.match(r"^https?://(?:www\.)?t\.me/", text):
+        await message.answer("Send a Telegram t.me message link, or use /range <chat> <start> <end>.")
         return
-    destination = get_destination(message.from_user.id)
-    if not destination:
-        await message.answer("Set a destination first with /setdestination")
+
+    if not get_destination(user_id):
+        await message.answer("Set a destination first with /setdestination <chat_id_or_username>")
         return
+
     status = await message.answer("🔎 Scanning message...")
     try:
-        source, source_message = await resolve_message_link(text)
+        source, source_message = await resolve_source_and_message(text)
         if not getattr(source_message, "media", None):
             await status.edit_text("That message does not contain downloadable media.")
             return
-        job = SelectionJob(
-            owner_id=message.from_user.id,
-            source=source,
-            message_ids=[source_message.id],
-            candidates={source_message.id: source_message},
-            destination=destination,
-            bot_message_id=status.message_id,
-            selected={source_message.id},
-        )
-        JOBS[message.from_user.id] = job
-        await status.edit_text(scan_summary([source_message]), reply_markup=build_scan_keyboard(message.from_user.id))
+        await create_job_from_messages(user_id, source, [source_message], status)
     except (ValueError, RPCError) as exc:
         await status.edit_text(f"Could not resolve that message: {exc}")
 
 
+# ---------------------------------------------------------------------------
+# Inline callbacks
+# ---------------------------------------------------------------------------
 @dp.callback_query(F.data.startswith("pick:"))
 async def pick_callback(callback: CallbackQuery) -> None:
-    if not is_allowed(callback.from_user.id):
+    user_id = callback.from_user.id
+    if not is_allowed(user_id):
         await callback.answer("Not authorized", show_alert=True)
         return
-    parts = callback.data.split(":")
-    job_id = int(parts[1])
-    kind = parts[2]
-    job = JOBS.get(job_id)
-    if not job or job.owner_id != callback.from_user.id:
+
+    _, owner_text, kind = callback.data.split(":", 2)
+    owner_id = int(owner_text)
+    job = JOBS.get(owner_id)
+    if not job or owner_id != user_id:
         await callback.answer("Job expired", show_alert=True)
         return
+
     if kind == "all":
         job.selected = set(job.candidates)
     else:
-        job.selected = {mid for mid, msg in job.candidates.items() if media_kind(msg) == kind}
+        job.selected = {
+            message_id
+            for message_id, media_message in job.candidates.items()
+            if media_kind(media_message) == kind
+        }
+
     if not job.selected:
         await callback.answer("No files of that type", show_alert=True)
         return
+
     total_size = sum(media_size(job.candidates[mid]) for mid in job.selected)
     await callback.message.edit_text(
         f"Ready to process {len(job.selected)} file(s).\n\n"
         f"Total size: {format_size(total_size)}\n\n"
         f"Destination: {job.destination}\n\nConfirm?",
-        reply_markup=build_confirm_keyboard(job_id),
+        reply_markup=confirm_keyboard(user_id),
     )
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("select:"))
-async def select_callback(callback: CallbackQuery) -> None:
-    if not is_allowed(callback.from_user.id):
+@dp.callback_query(F.data.startswith("individual:"))
+async def individual_callback(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    if not is_allowed(user_id):
         await callback.answer("Not authorized", show_alert=True)
         return
-    job_id = int(callback.data.split(":")[1])
-    job = JOBS.get(job_id)
-    if not job or job.owner_id != callback.from_user.id:
+    owner_id = int(callback.data.split(":", 1)[1])
+    job = JOBS.get(owner_id)
+    if not job or owner_id != user_id:
         await callback.answer("Job expired", show_alert=True)
         return
     job.selected = set()
-    await callback.message.edit_text("Select individual files.\n\nSelected: 0", reply_markup=build_individual_keyboard(job))
+    await callback.message.edit_text(
+        "Select individual files.\n\nSelected: 0",
+        reply_markup=individual_keyboard(job),
+    )
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("toggle:"))
 async def toggle_callback(callback: CallbackQuery) -> None:
-    if not is_allowed(callback.from_user.id):
+    user_id = callback.from_user.id
+    if not is_allowed(user_id):
         await callback.answer("Not authorized", show_alert=True)
         return
-    _, object_id, message_id_text = callback.data.split(":")
-    job = next((j for j in JOBS.values() if id(j) == int(object_id)), None)
-    if not job or job.owner_id != callback.from_user.id:
+    _, owner_text, message_text = callback.data.split(":", 2)
+    owner_id = int(owner_text)
+    message_id = int(message_text)
+    job = JOBS.get(owner_id)
+    if not job or owner_id != user_id or message_id not in job.candidates:
         await callback.answer("Job expired", show_alert=True)
         return
-    message_id = int(message_id_text)
-    job.selected = job.selected or set()
+
     if message_id in job.selected:
         job.selected.remove(message_id)
     else:
         job.selected.add(message_id)
-    await callback.message.edit_reply_markup(reply_markup=build_individual_keyboard(job))
+    await callback.message.edit_reply_markup(reply_markup=individual_keyboard(job))
     await callback.answer(f"Selected: {len(job.selected)}")
 
 
-@dp.callback_query(F.data.startswith("confirm_select:"))
-async def confirm_select_callback(callback: CallbackQuery) -> None:
-    if not is_allowed(callback.from_user.id):
+@dp.callback_query(F.data.startswith("individual_confirm:"))
+async def individual_confirm_callback(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    if not is_allowed(user_id):
         await callback.answer("Not authorized", show_alert=True)
         return
-    object_id = int(callback.data.split(":")[1])
-    job = next((j for j in JOBS.values() if id(j) == object_id), None)
-    if not job or job.owner_id != callback.from_user.id:
+    owner_id = int(callback.data.split(":", 1)[1])
+    job = JOBS.get(owner_id)
+    if not job or owner_id != user_id:
         await callback.answer("Job expired", show_alert=True)
         return
     if not job.selected:
         await callback.answer("Select at least one file", show_alert=True)
         return
+
+    total_size = sum(media_size(job.candidates[mid]) for mid in job.selected)
     await callback.message.edit_text(
-        f"Selected {len(job.selected)} file(s).\n\nDestination: {job.destination}\n\nConfirm?",
-        reply_markup=build_confirm_keyboard(callback.from_user.id),
+        f"Selected {len(job.selected)} file(s).\n"
+        f"Total size: {format_size(total_size)}\n\n"
+        f"Destination: {job.destination}\n\nConfirm?",
+        reply_markup=confirm_keyboard(user_id),
     )
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("confirm:"))
 async def confirm_callback(callback: CallbackQuery) -> None:
-    if not is_allowed(callback.from_user.id):
+    user_id = callback.from_user.id
+    if not is_allowed(user_id):
         await callback.answer("Not authorized", show_alert=True)
         return
-    job_id = int(callback.data.split(":")[1])
-    job = JOBS.get(job_id)
-    if not job or job.owner_id != callback.from_user.id:
+    owner_id = int(callback.data.split(":", 1)[1])
+    job = JOBS.get(owner_id)
+    if not job or owner_id != user_id:
         await callback.answer("Job expired", show_alert=True)
         return
+    if not job.selected:
+        await callback.answer("Nothing selected", show_alert=True)
+        return
+
     await callback.answer("Started")
-    await process_job(job, callback.from_user.id, callback.message)
-    JOBS.pop(callback.from_user.id, None)
+    try:
+        await process_job(job, callback.message)
+    finally:
+        JOBS.pop(user_id, None)
 
 
 @dp.callback_query(F.data.startswith("cancel:"))
 async def cancel_callback(callback: CallbackQuery) -> None:
-    if not is_allowed(callback.from_user.id):
+    user_id = callback.from_user.id
+    if not is_allowed(user_id):
         await callback.answer("Not authorized", show_alert=True)
         return
-    job_id = int(callback.data.split(":")[1])
-    job = JOBS.get(job_id)
-    if job and job.owner_id == callback.from_user.id:
-        JOBS.pop(callback.from_user.id, None)
+    owner_id = int(callback.data.split(":", 1)[1])
+    job = JOBS.get(owner_id)
+    if job and owner_id == user_id:
+        JOBS.pop(owner_id, None)
     await callback.message.edit_text("❌ Cancelled.")
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("cancel_obj:"))
-async def cancel_obj_callback(callback: CallbackQuery) -> None:
-    if not is_allowed(callback.from_user.id):
-        await callback.answer("Not authorized", show_alert=True)
-        return
-    object_id = int(callback.data.split(":")[1])
-    job = next((j for j in JOBS.values() if id(j) == object_id), None)
-    if job:
-        JOBS.pop(job.owner_id, None)
-    await callback.message.edit_text("❌ Cancelled.")
-    await callback.answer()
+@dp.callback_query(F.data.startswith("noop:"))
+async def noop_callback(callback: CallbackQuery) -> None:
+    await callback.answer("Use /select 101,102,... for IDs beyond the first 50.", show_alert=True)
 
 
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
 async def run_telethon() -> None:
+    # First launch must create the Telethon session interactively. After that,
+    # the same session file can be securely supplied to the hosting service.
     await user_client.start(phone=PHONE_NUMBER)
     me = await user_client.get_me()
     print(f"Telethon connected as {getattr(me, 'username', None) or me.id}")
@@ -575,9 +699,11 @@ async def run_bot() -> None:
 
 async def main() -> None:
     if not API_ID or not API_HASH or not PHONE_NUMBER or not BOT_TOKEN:
-        raise RuntimeError("Set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE_NUMBER and TELEGRAM_BOT_TOKEN.")
+        raise RuntimeError(
+            "Set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE_NUMBER and TELEGRAM_BOT_TOKEN."
+        )
     if not ALLOWED_USER_IDS:
-        raise RuntimeError("Set TELEGRAM_ALLOWED_USER_IDS to one or more Telegram user IDs.")
+        raise RuntimeError("Set TELEGRAM_ALLOWED_USER_IDS to at least one Telegram user ID.")
 
     telethon_task = asyncio.create_task(run_telethon(), name="telethon-user-client")
     bot_task = asyncio.create_task(run_bot(), name="aiogram-bot")
