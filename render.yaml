@@ -1,0 +1,29 @@
+services:
+  - type: worker
+    name: hj-groups-telegram-media-collector
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python telegram_chat_exporter.py
+    envVars:
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_PHONE_NUMBER
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ALLOWED_USER_IDS
+        sync: false
+      - key: TELEGRAM_DESTINATION
+        sync: false
+      - key: TELEGRAM_BRANDING
+        value: "@hjgroups_1"
+      - key: TELEGRAM_BOT_DELETE_SECONDS
+        value: "3600"
+      - key: TELEGRAM_MAX_BULK_MESSAGES
+        value: "500"
+      - key: TELEGRAM_MAX_ACTIVE_JOBS
+        value: "1"
+      - key: TELEGRAM_SESSION_NAME
+        value: "telegram_user_session"
