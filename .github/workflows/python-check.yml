@@ -1,15 +1,18 @@
-name: Python syntax check
+name: Python syntax and Voroa smoke check
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
 jobs:
-  compile:
+  validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python -m py_compile start.py telegram_bot.py telegram_session_store.py playbook_client.py
+      - name: Compile Python files
+        run: python -m py_compile start.py telegram_bot.py telegram_session_store.py playbook_client.py smoke_test.py
+      - name: Run deterministic smoke regression
+        run: python smoke_test.py
