@@ -1,8 +1,0 @@
-{
-  "name": "hj-groups-url-uploader-bot-worker",
-  "private": true,
-  "version": "1.0.0",
-  "scripts": {
-    "start": "node worker.js"
-  }
-}
