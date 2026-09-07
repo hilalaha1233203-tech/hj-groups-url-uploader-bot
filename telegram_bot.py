@@ -256,10 +256,12 @@ def format_eta(seconds):
     return f"{minutes}m {secs}s left"
 
 def make_progress_callback(status, filename, stage, started_at):
-    state = {"last": 0.0}
+    state = {"last": 0.0, "task": None}
     def callback(current, total):
         now = time.monotonic()
-        if total and current < total and now - state["last"] < 0.8:
+        if total and current >= total:
+            return
+        if total and now - state["last"] < 0.8:
             return
         state["last"] = now
         if total:
@@ -267,13 +269,16 @@ def make_progress_callback(status, filename, stage, started_at):
             elapsed = max(0.1, now - started_at)
             rate = current / elapsed if current > 0 else 0.0
             eta = ((total - current) / rate) if rate > 0 else None
-            text = (f"📄 {filename}\n\n"
-                    f"{stage}\n"
-                    f"[{int(percent):3d}%] {'█' * int(percent // 10)}{'░' * (10 - int(percent // 10))}\n"
+            filled = int(percent // 10)
+            text = (f"📄 {filename}\n\n{stage}\n"
+                    f"[{int(percent):3d}%] {'█' * filled}{'░' * (10 - filled)}\n"
                     f"⏳ {format_eta(eta)}")
         else:
             text = f"📄 {filename}\n\n{stage}\n⏳ calculating…"
-        asyncio.create_task(status.edit_text(text, reply_markup=menu()))
+        previous = state.get("task")
+        if previous is not None and not previous.done():
+            previous.cancel()
+        state["task"] = asyncio.create_task(status.edit_text(text, reply_markup=menu()))
     return callback
 
 def scan_menu(uid):
