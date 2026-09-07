@@ -12,4 +12,4 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python -m py_compile telegram_chat_exporter.py telegram_session_store.py playbook_client.py
+      - run: python -m py_compile start.py telegram_bot.py telegram_session_store.py playbook_client.py
