@@ -20,7 +20,8 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, RPCError
+from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError
+from telegram_session_store import session_store
 
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
@@ -51,7 +52,7 @@ for item in os.getenv("TELEGRAM_USER_DESTINATIONS", "").split("|"):
 if SESSION_STRING:
     user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 else:
-    user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+    user_client = TelegramClient(StringSession(), API_ID, API_HASH)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -70,6 +71,21 @@ class SelectionJob:
 
 
 JOBS: dict[int, SelectionJob] = {}
+
+LOGIN_PHONE: str | None = None
+LOGIN_CODE_HASH: str | None = None
+LOGIN_LOCK = asyncio.Lock()
+
+async def get_saved_session() -> str | None:
+    return SESSION_STRING or await session_store.get()
+
+async def rebuild_user_client(session_string: str) -> None:
+    global user_client
+    if user_client.is_connected():
+        await user_client.disconnect()
+    user_client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    await user_client.connect()
+
 
 
 def is_allowed(user_id: int | None) -> bool:
@@ -325,6 +341,104 @@ async def start_handler(message: Message) -> None:
     )
 
 
+@dp.message(Command("login"))
+async def login_handler(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    if not is_allowed(user_id):
+        return
+    global LOGIN_PHONE, LOGIN_CODE_HASH
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Usage: /login +91xxxxxxxxxx")
+        return
+    if not session_store.configured and not SESSION_STRING:
+        await message.answer("Session storage is not configured.")
+        return
+    async with LOGIN_LOCK:
+        try:
+            phone = parts[1].strip()
+            await user_client.connect()
+            sent = await user_client.send_code_request(phone)
+            LOGIN_PHONE = phone
+            LOGIN_CODE_HASH = sent.phone_code_hash
+            await message.answer("OTP sent. Reply with /otp 12345")
+        except Exception as exc:
+            await message.answer(f"Login failed: {type(exc).__name__}: {exc}")
+
+@dp.message(Command("otp"))
+async def otp_handler(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    if not is_allowed(user_id):
+        return
+    global LOGIN_PHONE, LOGIN_CODE_HASH
+    if not LOGIN_PHONE or not LOGIN_CODE_HASH:
+        await message.answer("No login is waiting. Use /login first.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Usage: /otp 12345")
+        return
+    async with LOGIN_LOCK:
+        try:
+            await user_client.sign_in(LOGIN_PHONE, parts[1].strip(), phone_code_hash=LOGIN_CODE_HASH)
+            await session_store.set(user_client.session.save())
+            LOGIN_PHONE = None
+            LOGIN_CODE_HASH = None
+            await message.answer("Telegram account login successful.")
+        except SessionPasswordNeededError:
+            await message.answer("2FA enabled. Reply with /2fa your_password")
+        except Exception as exc:
+            await message.answer(f"OTP login failed: {type(exc).__name__}: {exc}")
+
+@dp.message(Command("2fa"))
+async def twofa_handler(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    if not is_allowed(user_id):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Usage: /2fa your_password")
+        return
+    try:
+        await user_client.sign_in(password=parts[1])
+        await session_store.set(user_client.session.save())
+        await message.answer("Telegram account login successful.")
+    except Exception as exc:
+        await message.answer(f"2FA login failed: {type(exc).__name__}: {exc}")
+
+@dp.message(Command("logout"))
+async def logout_handler(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    if not is_allowed(user_id):
+        return
+    try:
+        if user_client.is_connected():
+            await user_client.log_out()
+    finally:
+        await session_store.clear()
+    await message.answer("Telegram account logged out and saved session removed.")
+
+@dp.message(Command("session"))
+async def session_handler(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    if not is_allowed(user_id):
+        return
+    session = await get_saved_session()
+    if not session:
+        await message.answer("No Telegram user session. Use /login.")
+        return
+    try:
+        if not user_client.is_connected():
+            await rebuild_user_client(session)
+        ok = await user_client.is_user_authorized()
+        if ok:
+            me = await user_client.get_me()
+            await message.answer(f"Session active: {getattr(me, 'username', None) or me.id}")
+        else:
+            await message.answer("Session is not authorized. Use /login.")
+    except Exception as exc:
+        await message.answer(f"Session check failed: {type(exc).__name__}: {exc}")
+
 @dp.message(Command("setdestination"))
 async def set_destination_handler(message: Message) -> None:
     user_id = message.from_user.id if message.from_user else None
@@ -550,15 +664,14 @@ async def noop_callback(callback: CallbackQuery) -> None:
 
 
 async def run_telethon() -> None:
-    if SESSION_STRING:
-        await user_client.start()
-    else:
-        await user_client.start(phone=PHONE_NUMBER)
-    if not await user_client.is_user_authorized():
-        raise RuntimeError("Telethon account is not authorized. Create a session first.")
-    me = await user_client.get_me()
-    print(f"Telethon connected as {getattr(me, 'username', None) or me.id}")
-    await user_client.run_until_disconnected()
+    session = await get_saved_session()
+    if session:
+        await rebuild_user_client(session)
+        if await user_client.is_user_authorized():
+            me = await user_client.get_me()
+            print(f"Telethon connected as {getattr(me, 'username', None) or me.id}")
+        return
+    print("Telethon user session not configured; use /login")
 
 
 async def run_bot() -> None:
@@ -569,8 +682,6 @@ async def run_bot() -> None:
 async def main() -> None:
     if not API_ID or not API_HASH or not BOT_TOKEN:
         raise RuntimeError("Set TELEGRAM_API_ID, TELEGRAM_API_HASH and TELEGRAM_BOT_TOKEN.")
-    if not SESSION_STRING and not PHONE_NUMBER:
-        raise RuntimeError("Set TELEGRAM_SESSION_STRING for hosting or TELEGRAM_PHONE_NUMBER for local first login.")
     if not ALLOWED_USER_IDS:
         raise RuntimeError("Set TELEGRAM_ALLOWED_USER_IDS to at least one Telegram user ID.")
     telethon_task = asyncio.create_task(run_telethon(), name="telethon-user-client")
@@ -584,6 +695,7 @@ async def main() -> None:
         await asyncio.gather(telethon_task, bot_task, return_exceptions=True)
         if user_client.is_connected():
             await user_client.disconnect()
+        await session_store.close()
         await bot.session.close()
 
 
