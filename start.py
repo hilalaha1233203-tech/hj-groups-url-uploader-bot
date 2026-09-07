@@ -148,9 +148,11 @@ async def _durable_saved_session():
                 print("[Voroa] Restoring Telegram session from local mirror.", flush=True)
                 if getattr(session_store, "healthy", False) and getattr(session_store, "_collection", None) is not None:
                     try:
+                        payload = dict(local)
+                        payload.pop("_id", None)
                         await session_store._collection.update_one(
                             {"_id": "primary"},
-                            {"$set": dict(local, _id=None)},
+                            {"$set": payload},
                             upsert=True,
                         )
                     except Exception as exc:
