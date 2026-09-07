@@ -1,0 +1,57 @@
+name: Fix scan status fallback
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Patch scan status fallback
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('telegram_bot.py')
+          s = p.read_text(encoding='utf-8')
+          old = '''    async def safe_status(text):
+          try:
+              await asyncio.wait_for(status.edit_text(text, reply_markup=menu()), timeout=8)
+          except Exception as exc:
+              print(f"[Voroa] Status update failed: {type(exc).__name__}: {exc}", flush=True)
+'''
+          new = '''    async def safe_status(text):
+          nonlocal status
+          try:
+              await asyncio.wait_for(status.edit_text(text, reply_markup=menu()), timeout=8)
+              return
+          except Exception as exc:
+              print(f"[Voroa] Status edit failed: {type(exc).__name__}: {exc}", flush=True)
+          try:
+              status = await message.answer(text, reply_markup=menu())
+          except Exception as exc:
+              print(f"[Voroa] Status fallback send failed: {type(exc).__name__}: {exc}", flush=True)
+'''
+          if old not in s:
+              raise SystemExit('Expected safe_status block not found; refusing to modify file.')
+          s = s.replace(old, new, 1)
+          p.write_text(s, encoding='utf-8')
+          compile(s, 'telegram_bot.py', 'exec')
+          print('scan status fallback patched')
+          PY
+      - name: Commit patch and remove one-time workflow
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add telegram_bot.py
+          git commit -m 'Fix scan status update fallback' || true
+          git rm .github/workflows/fix-scan-status-fallback.yml
+          git commit -m 'Remove one-time scan status patch workflow'
+          git push
