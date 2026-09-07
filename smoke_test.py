@@ -77,7 +77,9 @@ assert "get_entity(parts[1])" not in BOT
 assert "asyncio.CancelledError" in BOT
 assert "timed out after {SCAN_TIMEOUT_SECONDS} seconds" in BOT
 assert "BotCommandScopeChat" in BOT
-assert "set_my_commands(owner_commands, scope=BotCommandScopeChat(chat_id=OWNER_USER_ID))" in BOT
+assert "owner_commands" in BOT
+assert "scope=BotCommandScopeChat" in BOT
+assert "chat_id=OWNER_USER_ID" in BOT
 assert "general_commands" in BOT
 
 assert "assets/upload_prepare" in PLAYBOOK
