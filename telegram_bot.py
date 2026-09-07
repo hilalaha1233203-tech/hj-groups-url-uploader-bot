@@ -13,6 +13,7 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    FSInputFile,
     BotCommand,
     MenuButtonCommands,
 )
@@ -21,6 +22,7 @@ from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError
 from telegram_session_store import session_store
 from playbook_client import PlaybookClient, PlaybookError
+import qrcode
 
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
@@ -287,29 +289,64 @@ async def help_cmd(message: Message):
     )
 
 @dp.message(Command("login"))
+async def qr_login_flow(message: Message, uid: int):
+    """QR login avoids Telegram's new-device code reuse/blocking path."""
+    async with LOGIN_LOCK:
+        try:
+            await rebuild("")
+            qr_login = await user_client.qr_login()
+            wait_task = asyncio.create_task(qr_login.wait(timeout=150))
+            qr_path = Path(tempfile.gettempdir()) / f"telegram_qr_{uid}.png"
+            img = qrcode.make(qr_login.url)
+            img.save(qr_path)
+            try:
+                await message.answer_photo(
+                    FSInputFile(qr_path),
+                    caption=(
+                        "🔐 Telegram QR Login\n\n"
+                        "1. Open Telegram on your phone.\n"
+                        "2. Settings → Devices → Link Desktop Device.\n"
+                        "3. Scan this QR code.\n\n"
+                        "The QR code expires automatically. Keep this chat open until login completes."
+                    ),
+                    reply_markup=menu(),
+                )
+            finally:
+                try:
+                    qr_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+            try:
+                await wait_task
+                session = user_client.session.save()
+                await session_store.set(session)
+                PENDING.pop(uid, None)
+                await message.answer("Telegram account login successful via QR. ✅", reply_markup=menu())
+            except SessionPasswordNeededError:
+                PENDING[uid] = "2fa_qr"
+                await message.answer(
+                    "✅ QR approved. Your Telegram account has 2FA enabled. Enter the 2FA password here or use /2fa your_password.",
+                    reply_markup=menu(),
+                )
+            except asyncio.TimeoutError:
+                await message.answer("⏱️ QR code expired. Press 🔐 Login to generate a new QR code.", reply_markup=menu())
+            except Exception as exc:
+                await message.answer(f"QR login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
+        except Exception as exc:
+            await message.answer(f"Could not start QR login: {type(exc).__name__}: {exc}", reply_markup=menu())
+
+@dp.message(Command("login"))
 async def login_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
     if not allowed(uid):
         await message.answer("⛔ You are not authorized to use this bot.")
         return
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) != 2:
-        PENDING[uid] = "phone"
-        return await message.answer("🔐 Send your Telegram phone number, for example +91xxxxxxxxxx.", reply_markup=menu())
     if not session_store.configured and not SESSION_STRING:
         return await message.answer("Session storage is not configured.", reply_markup=menu())
-    phone = parts[1].strip()
-    async with LOGIN_LOCK:
-        try:
-            await rebuild("")
-            sent = await user_client.send_code_request(phone)
-            await session_store.set_login(uid, phone, sent.phone_code_hash, user_client.session.save())
-            PENDING[uid] = "otp"
-            await message.answer("OTP sent. Enter the OTP number here or use /otp 12345.", reply_markup=menu())
-        except Exception as exc:
-            await session_store.clear_login(uid)
-            PENDING.pop(uid, None)
-            await message.answer(f"Login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
+    await qr_login_flow(message, uid)
+
+# QR_LOGIN_FIX_V1
 
 @dp.message(Command("otp"))
 async def otp_cmd(message: Message):
@@ -345,8 +382,17 @@ async def twofa_cmd(message: Message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2:
-        PENDING[uid] = "2fa"
+        PENDING[uid] = PENDING.get(uid) or "2fa"
         return await message.answer("Enter your Telegram 2FA password.", reply_markup=menu())
+    if PENDING.get(uid) == "2fa_qr":
+        try:
+            await user_client.sign_in(password=parts[1].strip())
+            await session_store.set(user_client.session.save())
+            PENDING.pop(uid, None)
+            await message.answer("Telegram account login successful via QR + 2FA. ✅", reply_markup=menu())
+        except Exception as exc:
+            await message.answer(f"2FA login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
+        return
     pending = await session_store.get_login(uid)
     if not pending or not pending.get("session_string"):
         return await message.answer("No 2FA login is waiting. Use 🔐 Login first.", reply_markup=menu())
@@ -524,7 +570,7 @@ async def text_handler(message: Message):
         return await login_cmd(message.model_copy(update={"text": f"/login {text}"}))
     if action == "otp":
         return await otp_cmd(message.model_copy(update={"text": f"/otp {text}"}))
-    if action == "2fa":
+    if action in {"2fa", "2fa_qr"}:
         return await twofa_cmd(message.model_copy(update={"text": f"/2fa {text}"}))
     if action == "destination":
         return await setdest_cmd(message.model_copy(update={"text": f"/setdestination {text}"}))
