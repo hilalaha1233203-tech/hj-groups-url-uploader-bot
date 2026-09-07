@@ -16,8 +16,6 @@ DB_NAME = os.getenv("TELEGRAM_SESSION_DB_NAME", "hj_groups_url_uploader").strip(
 COLLECTION_NAME = os.getenv("TELEGRAM_SESSION_COLLECTION", "telegram_sessions").strip()
 TIMEOUT_MS = int(os.getenv("TELEGRAM_SESSION_DB_TIMEOUT_MS", "10000"))
 CONNECT_TIMEOUT_MS = int(os.getenv("TELEGRAM_SESSION_DB_CONNECT_TIMEOUT_MS", "10000"))
-# Voroa service filesystems are ephemeral. Use /data when a persistent disk is
-# attached; operators can override this with TELEGRAM_LOCAL_STATE_FILE.
 LOCAL_FILE = Path(os.getenv("TELEGRAM_LOCAL_STATE_FILE", "/data/voroa_session_store.json"))
 
 
@@ -82,28 +80,37 @@ class SessionStore:
         self._local.pop(key, None)
         self._save_local()
 
-    async def _sync_local_to_mongo(self) -> None:
-        """Restore locally mirrored records that were saved while MongoDB was down.
+    def _local_tombstone(self, key: str) -> None:
+        self._local[key] = {
+            "_deleted": True,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._save_local()
 
-        MongoDB remains authoritative when a document already exists. The local
-        mirror is inserted only when the corresponding document is missing.
-        """
+    async def _sync_local_to_mongo(self) -> None:
+        """Replay locally mirrored writes/deletes after MongoDB recovery."""
         if not self._mongo_healthy or self._collection is None or not self._local:
             return
         for key, payload in list(self._local.items()):
             if not isinstance(payload, dict):
                 continue
             try:
-                await self._collection.update_one(
-                    {"_id": key},
-                    {"$setOnInsert": payload},
-                    upsert=True,
-                )
+                if payload.get("_deleted"):
+                    await self._collection.delete_one({"_id": key})
+                    self._local.pop(key, None)
+                else:
+                    await self._collection.update_one(
+                        {"_id": key},
+                        {"$setOnInsert": payload},
+                        upsert=True,
+                    )
             except (PyMongoError, OSError, TimeoutError) as exc:
                 self._last_error = exc
                 self._mongo_healthy = False
                 print(f"[Voroa] Local-to-Mongo sync paused: {type(exc).__name__}: {exc}", flush=True)
+                self._save_local()
                 return
+        self._save_local()
 
     async def ping(self) -> bool:
         if not self.configured:
@@ -153,6 +160,8 @@ class SessionStore:
         if self._mongo_healthy:
             return None
         local = self._local_get("primary")
+        if (local or {}).get("_deleted"):
+            return None
         value = (local or {}).get("session_string", "")
         return str(value).strip() or None
 
@@ -168,9 +177,11 @@ class SessionStore:
 
     async def clear(self) -> None:
         result = await self._mongo(lambda c: c.delete_one({"_id": "primary"}))
-        self._local_delete("primary")
-        if result is None and self.configured and self._mongo_healthy is False:
-            print("[Voroa] Telegram primary session removed from local mirror; MongoDB delete pending availability.", flush=True)
+        if result is None and self.configured:
+            self._local_tombstone("primary")
+            print("[Voroa] Telegram session delete queued for MongoDB recovery.", flush=True)
+        else:
+            self._local_delete("primary")
 
     async def get_login(self, user_id: int) -> Optional[Dict[str, Any]]:
         key = f"login:{int(user_id)}"
@@ -179,7 +190,7 @@ class SessionStore:
             if self._mongo_healthy:
                 return None
             document = self._local_get(key)
-        if not document:
+        if not document or document.get("_deleted"):
             return None
         return {
             "phone": str(document.get("phone", "")).strip(),
@@ -203,9 +214,11 @@ class SessionStore:
     async def clear_login(self, user_id: int) -> None:
         key = f"login:{int(user_id)}"
         result = await self._mongo(lambda c: c.delete_one({"_id": key}))
-        self._local_delete(key)
-        if result is None and self.configured and not self._mongo_healthy:
-            print(f"[Voroa] Login state {user_id} removed locally; MongoDB delete is unavailable.", flush=True)
+        if result is None and self.configured:
+            self._local_tombstone(key)
+            print(f"[Voroa] Login state {user_id} delete queued for MongoDB recovery.", flush=True)
+        else:
+            self._local_delete(key)
 
     async def get_destination(self, user_id: int) -> Optional[str]:
         key = f"destination:{int(user_id)}"
@@ -214,7 +227,9 @@ class SessionStore:
             if self._mongo_healthy:
                 return None
             document = self._local_get(key)
-        value = (document or {}).get("destination", "")
+        if not document or document.get("_deleted"):
+            return None
+        value = document.get("destination", "")
         return str(value).strip() or None
 
     async def set_destination(self, user_id: int, destination: str) -> None:
@@ -231,9 +246,11 @@ class SessionStore:
     async def clear_destination(self, user_id: int) -> None:
         key = f"destination:{int(user_id)}"
         result = await self._mongo(lambda c: c.delete_one({"_id": key}))
-        self._local_delete(key)
-        if result is None and self.configured and not self._mongo_healthy:
-            print(f"[Voroa] Destination {user_id} removed locally; MongoDB delete is unavailable.", flush=True)
+        if result is None and self.configured:
+            self._local_tombstone(key)
+            print(f"[Voroa] Destination {user_id} delete queued for MongoDB recovery.", flush=True)
+        else:
+            self._local_delete(key)
 
     async def get_access(self, user_id: int) -> Optional[dict[str, Any]]:
         key = f"access:{int(user_id)}"
@@ -242,7 +259,7 @@ class SessionStore:
             if self._mongo_healthy:
                 return None
             document = self._local_get(key)
-        if not document:
+        if not document or document.get("_deleted"):
             return None
         return {
             "user_id": int(user_id),
@@ -271,6 +288,8 @@ class SessionStore:
                 cursor = self._collection.find({"_id": {"$regex": r"^access:"}})
                 rows = []
                 async for document in cursor:
+                    if document.get("_deleted"):
+                        continue
                     rows.append({
                         "user_id": int(document.get("user_id")),
                         "active": bool(document.get("active", True)),
@@ -284,7 +303,7 @@ class SessionStore:
                 print(f"[Voroa] Access listing fell back to local mirror: {type(exc).__name__}: {exc}", flush=True)
         rows = []
         for document in self._local.values():
-            if not isinstance(document, dict) or "user_id" not in document:
+            if not isinstance(document, dict) or "user_id" not in document or document.get("_deleted"):
                 continue
             rows.append({
                 "user_id": int(document.get("user_id")),
