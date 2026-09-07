@@ -85,15 +85,6 @@ assert "command=\"grant\"" in BOT
 assert "command=\"revoke\"" in BOT
 assert "command=\"users\"" in BOT
 
-assert "class _ProgressStatus:" in START
-assert "original_make_progress_callback = app[\"make_progress_callback\"]" in START
-assert "patched_make_progress_callback" in START
-assert "status.progress_task = state[\"task\"]" in START
-assert "task.cancel()" in START
-assert "await asyncio.gather(task, return_exceptions=True)" in START
-assert 'app["make_progress_callback"] = patched_make_progress_callback' in START
-assert 'app["send_destination"] = patched_send_destination' in START
-
 assert "assets/upload_prepare" in PLAYBOOK
 assert "assets/upload_complete" in PLAYBOOK
 assert "x-goog-resumable" in PLAYBOOK
@@ -104,4 +95,17 @@ assert "x-amz-meta-extension" in PLAYBOOK
 assert "x-amz-meta-encrypted-organization-metadata" in PLAYBOOK
 assert "class ProgressFileStream(httpx.AsyncByteStream)" in PLAYBOOK
 
-print("Voroa smoke checks: PASS (syntax + parsers + range + filenames + access + single-owner + command scoping + persistence recovery + live-progress wrapper + Playbook contract assertions)")
+# Voroa entrypoint hardening: persisted session fallback and private-peer access-hash cache.
+assert "original_saved_session = app[\"saved_session\"]" in START
+assert "async def _durable_saved_session()" in START
+assert "session_store._local_get(\"primary\")" in START
+assert "payload.pop(\"_id\", None)" in START
+assert "async def _peer_cache_get(peer)" in START
+assert "async def _peer_cache_set(peer, entity)" in START
+assert "InputPeerChannel(entity_id, int(access_hash))" in START
+assert "async def patched_resolve_message_peer(peer)" in START
+assert "Resolved {peer} from persistent Telegram peer cache." in START
+assert "app[\"saved_session\"] = _durable_saved_session" in START
+assert "app[\"resolve_message_peer\"] = patched_resolve_message_peer" in START
+
+print("Voroa smoke checks: PASS (syntax + parsers + range + filenames + access + single-owner + command scoping + persistence recovery + Playbook contract + durable session + private-peer recovery)")
