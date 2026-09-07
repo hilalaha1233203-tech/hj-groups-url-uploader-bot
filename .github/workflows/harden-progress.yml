@@ -1,0 +1,54 @@
+name: Harden Voroa Progress
+on:
+  push:
+    branches: [main]
+jobs:
+  check:
+    if: "!contains(github.event.head_commit.message, '[skip progress]')"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply hardening
+        run: python .github/scripts/harden_progress_race.py
+      - name: Compile
+        run: python -m py_compile start.py telegram_bot.py telegram_session_store.py playbook_client.py
+      - name: 100x isolated progress-function regression test
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          src = Path('telegram_bot.py').read_text(encoding='utf-8')
+          tree = ast.parse(src)
+          wanted = {'format_eta'}
+          nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
+          ns = {}
+          exec(compile(ast.Module(body=nodes, type_ignores=[]), 'subset.py', 'exec'), ns)
+          assert ns['format_eta'](4) == '4s left'
+          assert ns['format_eta'](3) == '3s left'
+          for _ in range(100):
+              assert ns['format_eta'](4) == '4s left'
+              assert ns['format_eta'](3) == '3s left'
+          print('100x progress regression test passed.')
+          PY
+      - name: Static race audit
+        run: |
+          grep -q 'current >= total' telegram_bot.py
+          grep -q 'previous.cancel()' telegram_bot.py
+          grep -q 'def safe_filename(msg):' telegram_bot.py
+          grep -q 'Permanent destination saved' telegram_bot.py
+          grep -q 'Scan timed out after 35 seconds' telegram_bot.py
+          git diff --check
+      - name: Commit validated source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add telegram_bot.py
+          git reset -- .github/scripts/harden_progress_race.py .github/workflows/harden-progress.yml
+          git diff --cached --check
+          git commit -m "Prevent stale transfer progress updates [skip progress]"
+          git push
