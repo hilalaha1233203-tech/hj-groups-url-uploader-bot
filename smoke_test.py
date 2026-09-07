@@ -16,7 +16,7 @@ compile((ROOT / "start.py").read_text(encoding="utf-8"), "start.py", "exec")
 module = ast.parse(BOT)
 needed = {"parse_link", "parse_bulk_link", "format_eta"}
 selected = [node for node in module.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in needed]
-ns = {"re": __import__("re")}
+ns = {"re": __import__("re"), "MAX_BULK_MESSAGES": 500}
 exec(compile(ast.Module(body=selected, type_ignores=[]), "telegram_bot.py:test", "exec"), ns)
 
 parse_link = ns["parse_link"]
