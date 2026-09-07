@@ -126,6 +126,28 @@ def access_role(uid):
             return None
     return str(record.get("role", "vip")).lower()
 
+def access_role(uid):
+    if not uid:
+        return None
+    uid = int(uid)
+    if OWNER_USER_ID and uid == OWNER_USER_ID:
+        return "owner"
+    record = ACCESS_CACHE.get(uid)
+    if not record or not record.get("active", False):
+        return None
+    expires_at = record.get("expires_at")
+    if expires_at is not None:
+        if isinstance(expires_at, str):
+            try:
+                expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) >= expires_at:
+            return None
+    return str(record.get("role", "vip")).lower()
+
 def allowed(uid):
     return access_role(uid) in {"owner", "vip", "user"}
 
