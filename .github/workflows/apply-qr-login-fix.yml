@@ -1,0 +1,30 @@
+name: Apply QR login fix
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message != 'Apply QR login fix'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply patch
+        run: python .github/scripts/apply_qr_login_fix.py
+      - name: Validate Python
+        run: python -m py_compile start.py telegram_bot.py telegram_session_store.py playbook_client.py
+      - name: Commit patched application and remove one-time tooling
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f .github/scripts/apply_qr_login_fix.py .github/workflows/apply-qr-login-fix.yml
+          git add telegram_bot.py requirements.txt .github/scripts/apply_qr_login_fix.py .github/workflows/apply-qr-login-fix.yml
+          git commit -m 'Apply QR login fix'
+          git push
