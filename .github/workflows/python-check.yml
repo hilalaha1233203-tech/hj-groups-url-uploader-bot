@@ -21,5 +21,8 @@ jobs:
       - name: Compile Python files
         run: python -m py_compile start.py telegram_bot.py telegram_session_store.py playbook_client.py smoke_test.py
 
+      - name: Load Voroa entrypoint
+        run: python -c "import runpy; runpy.run_path('start.py', run_name='voroa_entrypoint_test')"
+
       - name: Run deterministic smoke regression
         run: python smoke_test.py
