@@ -56,6 +56,10 @@ assert "if not is_owner(uid):" in BOT
 assert "role=\"vip\"" in BOT
 assert "VOROA_OWNER_USER_ID" in BOT
 assert "explicit_owner = EXPLICIT_OWNER_ID" in BOT
+assert "if EXPLICIT_OWNER_ID:" in BOT
+assert "row_id != OWNER_USER_ID" in BOT
+assert "active=False, expires_at=None, role=\"user\"" in BOT
+
 assert "MongoDB connected" in STORE
 assert "local mirror" in STORE
 assert "/data/voroa_session_store.json" in STORE
@@ -86,4 +90,4 @@ assert "x-amz-meta-extension" in PLAYBOOK
 assert "x-amz-meta-encrypted-organization-metadata" in PLAYBOOK
 assert "class ProgressFileStream(httpx.AsyncByteStream)" in PLAYBOOK
 
-print("Voroa smoke checks: PASS (syntax + parsers + range + filenames + access + command scoping + persistence recovery + Playbook contract assertions)")
+print("Voroa smoke checks: PASS (syntax + parsers + range + filenames + access + single-owner + command scoping + persistence recovery + Playbook contract assertions)")
