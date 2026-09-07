@@ -790,34 +790,56 @@ async def text_handler(message: Message):
         return await message.answer("Set a destination first with 🎯 Destination.", reply_markup=menu())
 
     bulk = parse_bulk_link(text)
-    status = await message.answer("🔎 Scanning bulk messages..." if bulk else "🔎 Scanning message...", reply_markup=menu())
+    status = await message.answer("🔎 Starting bulk scan…" if bulk else "🔎 Starting scan…", reply_markup=menu())
+
+    async def safe_status(text):
+        try:
+            await asyncio.wait_for(status.edit_text(text, reply_markup=menu()), timeout=8)
+        except Exception as exc:
+            print(f"[Voroa] Status update failed: {type(exc).__name__}: {exc}", flush=True)
+
+    async def bounded(coro, timeout=SCAN_TIMEOUT_SECONDS):
+        task = asyncio.create_task(coro)
+        try:
+            return await asyncio.wait_for(task, timeout=timeout)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=2)
+            except Exception:
+                pass
+            try:
+                if user_client.is_connected():
+                    await asyncio.wait_for(user_client.disconnect(), timeout=5)
+            except Exception:
+                pass
+            raise
+
     try:
-        await ensure_user_client()
+        await safe_status("🔐 Checking Telegram session…")
+        await bounded(ensure_user_client())
         if bulk:
             peer, start_id, end_id = bulk
-            await status.edit_text(f"🔎 Resolving Telegram channel…\n📦 Range: {start_id}–{end_id}", reply_markup=menu())
-            source = await asyncio.wait_for(resolve_message_peer(peer), timeout=SCAN_TIMEOUT_SECONDS)
-            await status.edit_text(f"🔎 Fetching messages {start_id}–{end_id}…", reply_markup=menu())
-            msgs = await asyncio.wait_for(
-                user_client.get_messages(source, ids=list(range(start_id, end_id + 1))),
-                timeout=SCAN_TIMEOUT_SECONDS,
-            )
+            await safe_status(f"🔎 Resolving Telegram channel…\n📦 Range: {start_id}–{end_id}")
+            source = await bounded(resolve_message_peer(peer))
+            await safe_status(f"🔎 Fetching messages {start_id}–{end_id}…")
+            msgs = await bounded(user_client.get_messages(source, ids=list(range(start_id, end_id + 1))))
             media_msgs = [msg for msg in msgs if msg and getattr(msg, "media", None)]
             await create_job(uid, source, media_msgs, status)
             return
 
         peer, mid = parse_link(text)
-        await status.edit_text(f"🔎 Resolving Telegram channel…\n📌 Message: {mid}", reply_markup=menu())
-        source = await asyncio.wait_for(resolve_message_peer(peer), timeout=SCAN_TIMEOUT_SECONDS)
-        await status.edit_text(f"🔎 Fetching message {mid}…", reply_markup=menu())
-        msg = await asyncio.wait_for(user_client.get_messages(source, ids=mid), timeout=SCAN_TIMEOUT_SECONDS)
+        await safe_status(f"🔎 Resolving Telegram channel…\n📌 Message: {mid}")
+        source = await bounded(resolve_message_peer(peer))
+        await safe_status(f"🔎 Fetching message {mid}…")
+        msg = await bounded(user_client.get_messages(source, ids=mid))
         if not msg or not getattr(msg, "media", None):
-            return await status.edit_text("That message does not contain downloadable media.", reply_markup=menu())
+            return await safe_status("That message does not contain downloadable media.")
         await create_job(uid, source, [msg], status)
     except asyncio.TimeoutError:
-        await status.edit_text("⏱️ Scan timed out after 35 seconds.\n\nCheck that the logged-in Telegram account can open this channel and try again.", reply_markup=menu())
+        await safe_status("⏱️ Telegram scan timed out after 35 seconds.\n\nThe scan was stopped safely instead of hanging. Check that the logged-in Telegram account can access this channel, then try again.")
     except (ValueError, RPCError) as exc:
-        await status.edit_text(f"Could not resolve that message: {exc}", reply_markup=menu())
+        await safe_status(f"Could not resolve that message: {exc}")
     except Exception as exc:
         print(f"Scan failed: {type(exc).__name__}: {exc}", flush=True)
         await status.edit_text(f"❌ Scan failed: {type(exc).__name__}: {exc}", reply_markup=menu())
