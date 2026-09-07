@@ -231,21 +231,26 @@ def _cached_entity(cached):
 
 
 async def patched_resolve_message_peer(peer):
+    # A known private channel/chat should be resolved from its persisted access
+    # hash first. This avoids a slow dialog scan after a redeploy and preserves
+    # access even when Telegram's in-memory entity cache was rebuilt.
+    cached = await _peer_cache_get(peer)
+    cached_entity = _cached_entity(cached)
+    if cached_entity is not None:
+        try:
+            resolved = await user_client.get_input_entity(cached_entity)
+            print(f"[Voroa] Resolved {peer} from persistent Telegram peer cache.", flush=True)
+            return resolved
+        except Exception as exc:
+            print(f"[Voroa] Cached peer for {peer} is no longer valid: {type(exc).__name__}: {exc}", flush=True)
     try:
         entity = await original_resolve_message_peer(peer)
         await _peer_cache_set(peer, entity)
         return entity
-    except Exception as first_error:
-        cached = await _peer_cache_get(peer)
-        entity = _cached_entity(cached)
-        if entity is not None:
-            try:
-                resolved = await user_client.get_input_entity(entity)
-                print(f"[Voroa] Resolved {peer} from persistent Telegram peer cache.", flush=True)
-                return resolved
-            except Exception as exc:
-                print(f"[Voroa] Cached peer for {peer} is no longer valid: {type(exc).__name__}: {exc}", flush=True)
-        raise first_error
+    except Exception:
+        # Preserve the original resolver's precise error and do not fabricate
+        # access to a private channel the logged-in account cannot reach.
+        raise
 
 
 app["make_progress_callback"] = patched_make_progress_callback
