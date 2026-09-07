@@ -288,7 +288,6 @@ async def help_cmd(message: Message):
         reply_markup=menu(),
     )
 
-@dp.message(Command("login"))
 async def qr_login_flow(message: Message, uid: int):
     """QR login avoids Telegram's new-device code reuse/blocking path."""
     async with LOGIN_LOCK:
