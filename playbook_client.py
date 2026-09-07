@@ -103,11 +103,9 @@ class PlaybookClient:
                 if not session_url:
                     raise PlaybookError("Playbook GCS upload did not return a resumable session URL")
 
-                # Playbook's GCS signed-upload flow requires this exact resumable
-                # byte upload shape; the byte PUT is not a normal media MIME PUT.
                 upload_headers = {
                     "Content-Type": "text/plain",
-                    "Content-Range": f"bytes 0-{max(size - 1, 0)}/{size}",
+                    "Content-Range": f"bytes */0" if size == 0 else f"bytes 0-{size - 1}/{size}",
                 }
                 try:
                     upload = await client.put(
@@ -135,6 +133,8 @@ class PlaybookClient:
                             raise PlaybookError(f"Playbook missing URL for multipart part {part_number}")
                         stream.seek((part_number - 1) * part_size)
                         chunk = stream.read(part_size)
+                        if not chunk and size > 0:
+                            raise PlaybookError(f"Playbook multipart part {part_number} is empty or out of range")
                         try:
                             response = await client.put(part_url, content=chunk)
                             response.raise_for_status()
@@ -144,13 +144,7 @@ class PlaybookClient:
                         if progress_callback:
                             progress_callback(min(uploaded, size), size)
 
-                completed_payload = {
-                    "asset": {
-                        "signed_gcs_id": str(signed_id),
-                        "multipart_upload_id": multipart_id,
-                        "title": file_title,
-                    }
-                }
+                completed_payload = {"asset": {"signed_gcs_id": str(signed_id), "multipart_upload_id": multipart_id, "title": file_title}}
                 completed = await self._request("POST", "assets/upload_complete", json=completed_payload)
                 asset = completed.get("data") or completed
                 token = asset.get("token")
@@ -165,8 +159,6 @@ class PlaybookClient:
                 if not upload_url:
                     raise PlaybookError("Playbook upload response did not include upload_url")
 
-                # Backblaze single-part upload requires the signed metadata headers
-                # returned by upload_prepare, verbatim.
                 headers = {"Content-Type": media_type}
                 extension = data.get("file_extension")
                 encrypted = data.get("encrypted_organization_metadata")
@@ -187,14 +179,7 @@ class PlaybookClient:
         completed = await self._request(
             "POST",
             "assets/upload_complete",
-            json={
-                "asset": {
-                    "signed_gcs_id": str(signed_id),
-                    "title": file_title,
-                    "media_type": media_type,
-                    "size": size,
-                }
-            },
+            json={"asset": {"signed_gcs_id": str(signed_id), "title": file_title}},
         )
         asset = completed.get("data") or completed
         token = asset.get("token")
