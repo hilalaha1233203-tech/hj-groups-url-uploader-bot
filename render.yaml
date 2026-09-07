@@ -3,7 +3,7 @@ services:
     name: hj-groups-telegram-media-collector
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python telegram_chat_exporter.py
+    startCommand: python start.py
     envVars:
       - key: TELEGRAM_API_ID
         sync: false
