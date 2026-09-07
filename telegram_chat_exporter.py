@@ -13,6 +13,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+import tempfile
 from typing import Any, Awaitable, Callable
 
 from aiogram import Bot, Dispatcher, F
@@ -22,6 +23,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError
 from telegram_session_store import session_store
+from playbook_client import PlaybookClient, PlaybookError
 
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
@@ -267,9 +269,32 @@ def track_delete_task(task: asyncio.Task) -> None:
 
 
 async def send_to_destination(message: Any, destination: str) -> Any:
-    return await with_flood_wait(lambda: user_client.send_file(
-        destination, message.media, caption=caption_for(message)
-    ))
+    token = os.getenv("PLAYBOOK_API_TOKEN", "").strip()
+    org = os.getenv("PLAYBOOK_ORG_SLUG", "").strip()
+    if not token or not org:
+        return await with_flood_wait(lambda: user_client.send_file(
+            destination, message.media, caption=caption_for(message)
+        ))
+    temp_dir = Path(os.getenv("TELEGRAM_TEMP_DIR", tempfile.gettempdir()))
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    name = getattr(getattr(message, "file", None), "name", None) or ("telegram-" + str(getattr(message, "id", "media")))
+    temp_path = temp_dir / name
+    try:
+        await user_client.download_media(message, file=str(temp_path))
+        client = PlaybookClient(token=token, org_slug=org)
+        asset_token = await client.upload_file(temp_path, title=name)
+        asset = await client.get_asset(asset_token)
+        url = str(asset.get("display_url") or "").strip()
+        if not url:
+            raise PlaybookError("Playbook asset has no display_url")
+        return await with_flood_wait(lambda: user_client.send_file(
+            destination, url, name=name, caption=caption_for(message)
+        ))
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 async def send_to_bot_chat(message: Any, bot_chat_id: int) -> Any:
