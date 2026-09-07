@@ -77,10 +77,7 @@ def menu():
             [KeyboardButton(text="🔐 Login"), KeyboardButton(text="📱 Session")],
             [KeyboardButton(text="🚪 Logout"), KeyboardButton(text="❌ Cancel")],
             [KeyboardButton(text="ℹ️ Help")],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="Choose a function…",
+        ], resize_keyboard=True, is_persistent=True, input_field_placeholder="Choose a function…",
     )
 
 def access_role(uid):
@@ -95,21 +92,14 @@ def access_role(uid):
     expires_at = record.get("expires_at")
     if expires_at is not None:
         if isinstance(expires_at, str):
-            try:
-                expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-            except ValueError:
-                return None
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if datetime.now(timezone.utc) >= expires_at:
-            return None
+            try: expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            except ValueError: return None
+        if expires_at.tzinfo is None: expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) >= expires_at: return None
     return str(record.get("role", "vip")).lower()
 
-def allowed(uid):
-    return access_role(uid) in {"owner", "vip", "user"}
-
-def is_owner(uid):
-    return access_role(uid) == "owner"
+def allowed(uid): return access_role(uid) in {"owner", "vip", "user"}
+def is_owner(uid): return access_role(uid) == "owner"
 
 async def load_access_state():
     global OWNER_USER_ID
@@ -118,8 +108,7 @@ async def load_access_state():
     for row in rows:
         row_id = int(row["user_id"])
         ACCESS_CACHE[row_id] = row
-        if not explicit_owner and row.get("role") == "owner":
-            OWNER_USER_ID = row_id
+        if not explicit_owner and row.get("role") == "owner": OWNER_USER_ID = row_id
     if not OWNER_USER_ID:
         raise RuntimeError("No Voroa owner is configured. Set VOROA_OWNER_USER_ID or TELEGRAM_ALLOWED_USER_IDS.")
     if EXPLICIT_OWNER_ID:
@@ -131,20 +120,15 @@ async def load_access_state():
     await session_store.set_access(OWNER_USER_ID, active=True, expires_at=None, role="owner")
     ACCESS_CACHE[OWNER_USER_ID] = {"user_id": OWNER_USER_ID, "active": True, "expires_at": None, "role": "owner"}
     for uid in ALLOWED_USER_IDS:
-        if uid == OWNER_USER_ID:
-            continue
-        existing = ACCESS_CACHE.get(uid)
-        if not existing:
+        if uid == OWNER_USER_ID: continue
+        if not ACCESS_CACHE.get(uid):
             await session_store.set_access(uid, active=True, expires_at=None, role="user")
             ACCESS_CACHE[uid] = {"user_id": uid, "active": True, "expires_at": None, "role": "user"}
 
 def load_state():
     try:
-        value = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
-    except (OSError, ValueError, TypeError):
-        return {}
-
+        value = json.loads(STATE_FILE.read_text(encoding="utf-8")); return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError): return {}
 STATE = load_state()
 
 def save_state():
@@ -154,195 +138,132 @@ def save_state():
     except (OSError, TypeError) as exc:
         print(f"[Voroa] Local destination state write failed: {type(exc).__name__}: {exc}", flush=True)
 
-def destination(uid):
-    return (DESTINATIONS.get(str(uid)) or STATE.get(str(uid)) or ENV_DESTINATIONS.get(str(uid)) or DEFAULT_DESTINATION).strip()
+def destination(uid): return (DESTINATIONS.get(str(uid)) or STATE.get(str(uid)) or ENV_DESTINATIONS.get(str(uid)) or DEFAULT_DESTINATION).strip()
 
 async def load_destination(uid):
     cached = DESTINATIONS.get(str(uid))
-    if cached:
-        return cached
+    if cached: return cached
     saved = await session_store.get_destination(uid)
     if saved:
-        DESTINATIONS[str(uid)] = saved
-        return saved
+        DESTINATIONS[str(uid)] = saved; return saved
     value = (STATE.get(str(uid)) or ENV_DESTINATIONS.get(str(uid)) or DEFAULT_DESTINATION).strip()
     if value:
-        await session_store.set_destination(uid, value)
-        DESTINATIONS[str(uid)] = value
+        await session_store.set_destination(uid, value); DESTINATIONS[str(uid)] = value
     return value
 
 async def set_destination(uid, dest):
-    value = dest.strip()
-    await session_store.set_destination(uid, value)
-    DESTINATIONS[str(uid)] = value
-    STATE[str(uid)] = value
-    save_state()
-    return value
+    value = dest.strip(); await session_store.set_destination(uid, value)
+    DESTINATIONS[str(uid)] = value; STATE[str(uid)] = value; save_state(); return value
 
 def size(n):
-    if not n:
-        return "Unknown"
+    if not n: return "Unknown"
     value = float(n)
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if value < 1024 or unit == "TB":
-            return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        if value < 1024 or unit == "TB": return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
     return "Unknown"
 
 def kind(m):
     media = getattr(m, "media", None)
-    if media is None:
-        return None
-    if type(media).__name__ == "MessageMediaPhoto":
-        return "photo"
+    if media is None: return None
+    if type(media).__name__ == "MessageMediaPhoto": return "photo"
     doc = getattr(media, "document", None)
-    if doc is None:
-        return "other"
+    if doc is None: return "other"
     mime = (getattr(doc, "mime_type", "") or "").lower()
     names = {type(a).__name__ for a in (getattr(doc, "attributes", []) or [])}
-    if "DocumentAttributeAudio" in names or mime.startswith("audio/"):
-        return "audio"
-    if "DocumentAttributeVideo" in names or mime.startswith("video/"):
-        return "video"
-    if mime.startswith("image/"):
-        return "photo"
+    if "DocumentAttributeAudio" in names or mime.startswith("audio/"): return "audio"
+    if "DocumentAttributeVideo" in names or mime.startswith("video/"): return "video"
+    if mime.startswith("image/"): return "photo"
     return "document"
 
-def media_size(m):
-    return int(getattr(getattr(getattr(m, "media", None), "document", None), "size", 0) or 0)
+def media_size(m): return int(getattr(getattr(getattr(m, "media", None), "document", None), "size", 0) or 0)
 
 def caption(m):
     parts = []
     original = (getattr(m, "message", None) or "").strip()
-    if original:
-        parts.append(original)
+    if original: parts.append(original)
     parts.append(f"📦 File Size: {size(media_size(m))}")
-    if BRANDING:
-        parts.append(BRANDING)
+    if BRANDING: parts.append(BRANDING)
     return "\n\n".join(parts)[:1024]
 
 def parse_link(value):
     match = re.match(r"^https?://(?:www\.)?t\.me/(?:c/(\d+)|([A-Za-z0-9_]{3,}))/([0-9]+)(?:\?.*)?$", value.strip())
-    if not match:
-        raise ValueError("Invalid Telegram message link.")
-    private, username, mid = match.groups()
-    return (f"-100{private}" if private else f"@{username}"), int(mid)
+    if not match: raise ValueError("Invalid Telegram message link.")
+    private, username, mid = match.groups(); return (f"-100{private}" if private else f"@{username}"), int(mid)
 
 def parse_bulk_link(value):
     match = re.match(r"^https?://(?:www\.)?t\.me/(?:c/(\d+)|([A-Za-z0-9_]{3,}))/(\d+)\s*(?:-|\s)\s*(\d+)(?:\?.*)?$", value.strip())
-    if not match:
-        return None
-    private, username, start_text, end_text = match.groups()
-    start_id, end_id = int(start_text), int(end_text)
-    if start_id <= 0 or end_id < start_id:
-        raise ValueError("Invalid Telegram message ID range.")
-    count = end_id - start_id + 1
-    if count > MAX_BULK_MESSAGES:
-        raise ValueError(f"Maximum range is {MAX_BULK_MESSAGES} messages.")
-    peer = f"-100{private}" if private else f"@{username}"
-    return peer, start_id, end_id
+    if not match: return None
+    private, username, start_text, end_text = match.groups(); start_id, end_id = int(start_text), int(end_text)
+    if start_id <= 0 or end_id < start_id: raise ValueError("Invalid Telegram message ID range.")
+    if end_id - start_id + 1 > MAX_BULK_MESSAGES: raise ValueError(f"Maximum range is {MAX_BULK_MESSAGES} messages.")
+    return (f"-100{private}" if private else f"@{username}"), start_id, end_id
 
 async def flood(fn: Callable[[], Awaitable[Any]]):
     while True:
-        try:
-            return await fn()
-        except FloodWaitError as exc:
-            await asyncio.sleep(max(1, int(getattr(exc, "seconds", 1))) + 1)
+        try: return await fn()
+        except FloodWaitError as exc: await asyncio.sleep(max(1, int(getattr(exc, "seconds", 1))) + 1)
 
-async def saved_session():
-    return SESSION_STRING or await session_store.get()
+async def saved_session(): return SESSION_STRING or await session_store.get()
 
 async def rebuild(session):
     global user_client
-    if user_client.is_connected():
-        await user_client.disconnect()
+    if user_client.is_connected(): await user_client.disconnect()
     user_client = TelegramClient(StringSession(session), API_ID, API_HASH)
     await asyncio.wait_for(user_client.connect(), timeout=SCAN_TIMEOUT_SECONDS)
 
 async def ensure_user_client():
     session = await saved_session()
-    if not session:
-        raise RuntimeError("No saved Telegram session. Press 🔐 Login first.")
-    if not user_client.is_connected():
-        await rebuild(session)
-    authorized = await asyncio.wait_for(user_client.is_user_authorized(), timeout=SCAN_TIMEOUT_SECONDS)
-    if not authorized:
-        raise RuntimeError("Telegram session is no longer authorized. Press 🔐 Login first.")
+    if not session: raise RuntimeError("No saved Telegram session. Press 🔐 Login first.")
+    if not user_client.is_connected(): await rebuild(session)
+    if not await asyncio.wait_for(user_client.is_user_authorized(), timeout=SCAN_TIMEOUT_SECONDS): raise RuntimeError("Telegram session is no longer authorized. Press 🔐 Login first.")
 
 async def resolve_message_peer(peer):
-    try:
-        return await asyncio.wait_for(user_client.get_input_entity(peer), timeout=SCAN_TIMEOUT_SECONDS)
+    try: return await asyncio.wait_for(user_client.get_input_entity(peer), timeout=SCAN_TIMEOUT_SECONDS)
     except (ValueError, TypeError, KeyError):
-        target_text = str(peer).strip()
-        target_id = int(target_text) if target_text.lstrip("-").isdigit() else None
-        if target_id is None:
-            return await asyncio.wait_for(user_client.get_entity(target_text), timeout=SCAN_TIMEOUT_SECONDS)
+        target_text = str(peer).strip(); target_id = int(target_text) if target_text.lstrip("-").isdigit() else None
+        if target_id is None: return await asyncio.wait_for(user_client.get_entity(target_text), timeout=SCAN_TIMEOUT_SECONDS)
         raw_id, peer_cls = utils.resolve_id(target_id)
         if peer_cls is not None:
-            try:
-                return await asyncio.wait_for(user_client.get_input_entity(peer_cls(raw_id)), timeout=SCAN_TIMEOUT_SECONDS)
-            except (ValueError, TypeError, KeyError):
-                pass
+            try: return await asyncio.wait_for(user_client.get_input_entity(peer_cls(raw_id)), timeout=SCAN_TIMEOUT_SECONDS)
+            except (ValueError, TypeError, KeyError): pass
         async def find_in_dialogs():
             async for dialog in user_client.iter_dialogs():
                 entity = getattr(dialog, "entity", None)
-                if entity is None:
-                    continue
+                if entity is None: continue
                 try:
-                    if utils.get_peer_id(entity, add_mark=True) == target_id:
-                        return entity
-                except Exception:
-                    continue
+                    if utils.get_peer_id(entity, add_mark=True) == target_id: return entity
+                except Exception: continue
             return None
         entity = await asyncio.wait_for(find_in_dialogs(), timeout=SCAN_TIMEOUT_SECONDS)
-        if entity is None:
-            raise ValueError(
-                f"Telegram channel/chat {peer} is not accessible from the logged-in account. "
-                "The account must be a member of the channel and the channel must be visible in Telegram."
-            )
+        if entity is None: raise ValueError(f"Telegram channel/chat {peer} is not accessible from the logged-in account. The account must be a member of the channel and the channel must be visible in Telegram.")
         return entity
 
 def safe_filename(msg):
-    name = getattr(getattr(msg, "file", None), "name", None)
-    if not name:
-        name = f"telegram-{getattr(msg, 'id', 'media')}"
+    name = getattr(getattr(msg, "file", None), "name", None) or f"telegram-{getattr(msg, 'id', 'media')}"
     name = re.sub(r"[\\/:*?\"<>|\x00\r\n]+", "_", str(name)).strip(" .")
     return name[:240] or f"telegram-{getattr(msg, 'id', 'media')}"
 
 def format_eta(seconds):
-    if seconds is None or seconds < 0:
-        return "calculating…"
+    if seconds is None or seconds < 0: return "calculating…"
     seconds = int(round(seconds))
-    if seconds < 1:
-        return "0s left"
-    if seconds < 60:
-        return f"{seconds}s left"
-    minutes, secs = divmod(seconds, 60)
-    return f"{minutes}m {secs}s left"
+    if seconds < 1: return "0s left"
+    if seconds < 60: return f"{seconds}s left"
+    minutes, secs = divmod(seconds, 60); return f"{minutes}m {secs}s left"
 
 def make_progress_callback(status, filename, stage, started_at):
     state = {"last": 0.0, "task": None}
     def callback(current, total):
         now = time.monotonic()
-        if total and current >= total:
-            return
-        if total and now - state["last"] < 0.8:
-            return
+        if total and current >= total: return
+        if total and now - state["last"] < 0.8: return
         state["last"] = now
         if total:
-            percent = max(0.0, min(100.0, (current / total) * 100.0))
-            elapsed = max(0.1, now - started_at)
-            rate = current / elapsed if current > 0 else 0.0
-            eta = ((total - current) / rate) if rate > 0 else None
-            filled = int(percent // 10)
-            text = (f"📄 {filename}\n\n{stage}\n"
-                    f"[{int(percent):3d}%] {'█' * filled}{'░' * (10 - filled)}\n"
-                    f"⏳ {format_eta(eta)}")
-        else:
-            text = f"📄 {filename}\n\n{stage}\n⏳ calculating…"
+            percent = max(0.0, min(100.0, (current / total) * 100.0)); elapsed = max(0.1, now - started_at); rate = current / elapsed if current > 0 else 0.0; eta = ((total - current) / rate) if rate > 0 else None; filled = int(percent // 10)
+            text = f"📄 {filename}\n\n{stage}\n[{int(percent):3d}%] {'█' * filled}{'░' * (10 - filled)}\n⏳ {format_eta(eta)}"
+        else: text = f"📄 {filename}\n\n{stage}\n⏳ calculating…"
         previous = state.get("task")
-        if previous is not None and not previous.done():
-            previous.cancel()
+        if previous is not None and not previous.done(): previous.cancel()
         state["task"] = asyncio.create_task(status.edit_text(text, reply_markup=menu()))
     return callback
 
@@ -351,257 +272,176 @@ def scan_menu(uid):
         [InlineKeyboardButton(text="🎵 Audio", callback_data=f"pick:{uid}:audio"), InlineKeyboardButton(text="🎬 Video", callback_data=f"pick:{uid}:video")],
         [InlineKeyboardButton(text="📷 Photos", callback_data=f"pick:{uid}:photo"), InlineKeyboardButton(text="📄 Documents", callback_data=f"pick:{uid}:document")],
         [InlineKeyboardButton(text="⬇️ All files", callback_data=f"pick:{uid}:all")],
-        [InlineKeyboardButton(text="☑️ Select individually", callback_data=f"individual:{uid}")],
-        [InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{uid}")],
-    ])
+        [InlineKeyboardButton(text="☑️ Select individually", callback_data=f"individual:{uid}"),],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{uid}")],])
 
-def confirm_menu(uid):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Confirm", callback_data=f"confirm:{uid}")],
-        [InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{uid}")],
-    ])
+def confirm_menu(uid): return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Confirm", callback_data=f"confirm:{uid}")],[InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{uid}")]])
 
 def individual_menu(job):
     rows = []
-    for mid, msg in list(job.candidates.items())[:50]:
-        label = f"{'☑️' if mid in job.selected else '⬜'} #{mid} {kind(msg) or 'media'} {size(media_size(msg))}"
-        rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"toggle:{job.owner_id}:{mid}")])
-    rows += [
-        [InlineKeyboardButton(text="✅ Continue", callback_data=f"individual_confirm:{job.owner_id}")],
-        [InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job.owner_id}")],
-    ]
+    for mid, msg in list(job.candidates.items())[:50]: rows.append([InlineKeyboardButton(text=f"{'☑️' if mid in job.selected else '⬜'} #{mid} {kind(msg) or 'media'} {size(media_size(msg))}"[:60], callback_data=f"toggle:{job.owner_id}:{mid}")])
+    rows += [[InlineKeyboardButton(text="✅ Continue", callback_data=f"individual_confirm:{job.owner_id}")],[InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job.owner_id}")]]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def create_job(uid, source, messages, status):
-    if not messages:
-        return await status.edit_text("No downloadable media messages were found.", reply_markup=menu())
+    if not messages: return await status.edit_text("No downloadable media messages were found.", reply_markup=menu())
     dest = destination(uid)
-    if not dest:
-        return await status.edit_text("Set a destination first with /setdestination or 🎯 Destination.", reply_markup=menu())
-    candidates = {msg.id: msg for msg in messages}
-    JOBS[uid] = Job(uid, source, candidates, dest, set(candidates) if len(candidates) == 1 else set())
+    if not dest: return await status.edit_text("Set a destination first with /setdestination or 🎯 Destination.", reply_markup=menu())
+    candidates = {msg.id: msg for msg in messages}; JOBS[uid] = Job(uid, source, candidates, dest, set(candidates) if len(candidates) == 1 else set())
     await status.edit_text(f"🔎 Scan Complete\n\n📦 Files: {len(messages)}\n📦 Total size: {size(sum(media_size(msg) for msg in messages))}\n\nChoose what to process:", reply_markup=scan_menu(uid))
 
 async def send_destination(msg, dest, status=None, index=1, total_files=1):
-    token = os.getenv("PLAYBOOK_API_TOKEN", "").strip()
-    org = os.getenv("PLAYBOOK_ORG_SLUG", "").strip()
-    filename = safe_filename(msg)
-    started_at = time.monotonic()
+    token = os.getenv("PLAYBOOK_API_TOKEN", "").strip(); org = os.getenv("PLAYBOOK_ORG_SLUG", "").strip(); filename = safe_filename(msg); started_at = time.monotonic(); asset_token = None; client = None
     async def update(text):
         if status is not None:
-            try:
-                await status.edit_text(text, reply_markup=menu())
-            except Exception:
-                pass
-    if status is not None:
-        await update(f"📄 {filename}\n\n🚀 Starting file {index}/{total_files}\n⏳ calculating…")
+            try: await status.edit_text(text, reply_markup=menu())
+            except Exception: pass
+    if status is not None: await update(f"📄 {filename}\n\n🚀 Starting file {index}/{total_files}\n⏳ calculating…")
     if not token or not org:
-        callback = make_progress_callback(status, filename, "📤 Sending to destination…", started_at) if status is not None else None
-        kwargs = {"caption": caption(msg)}
-        if callback:
-            kwargs["progress_callback"] = callback
+        callback = make_progress_callback(status, filename, "📤 Sending to destination…", started_at) if status is not None else None; kwargs = {"caption": caption(msg)}
+        if callback: kwargs["progress_callback"] = callback
         sent = await flood(lambda: user_client.send_file(dest, msg.media, **kwargs))
-        if status is not None:
-            await update(f"✅ {filename}\n\n📤 Sent successfully\n⏱️ {int(time.monotonic() - started_at)}s")
+        if status is not None: await update(f"✅ {filename}\n\n📤 Sent successfully\n⏱️ {int(time.monotonic() - started_at)}s")
         return sent
-    temp_dir = Path(os.getenv("TELEGRAM_TEMP_DIR", tempfile.gettempdir()))
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    path = temp_dir / filename
+    temp_dir = Path(os.getenv("TELEGRAM_TEMP_DIR", tempfile.gettempdir())); temp_dir.mkdir(parents=True, exist_ok=True); path = temp_dir / filename
     try:
-        download_cb = make_progress_callback(status, filename, "📥 Downloading from Telegram…", started_at) if status is not None else None
-        download_kwargs = {"file": str(path)}
-        if download_cb:
-            download_kwargs["progress_callback"] = download_cb
+        download_cb = make_progress_callback(status, filename, "📥 Downloading from Telegram…", started_at) if status is not None else None; download_kwargs = {"file": str(path)}
+        if download_cb: download_kwargs["progress_callback"] = download_cb
         result = await user_client.download_media(msg, **download_kwargs)
-        if result is None or not path.is_file():
-            raise RuntimeError("Telegram media download did not produce a local file.")
-        client = PlaybookClient(token=token, org_slug=org)
-        upload_started = time.monotonic()
-        await update(f"📄 {filename}\n\n☁️ Uploading to temporary storage…\n⏳ calculating…")
+        if result is None or not path.is_file(): raise RuntimeError("Telegram media download did not produce a local file.")
+        client = PlaybookClient(token=token, org_slug=org); upload_started = time.monotonic(); await update(f"📄 {filename}\n\n☁️ Uploading to temporary storage…\n⏳ calculating…")
         asset_token = await client.upload_file(path, title=filename, progress_callback=(make_progress_callback(status, filename, "☁️ Uploading to temporary storage…", upload_started) if status is not None else None))
         asset = {}
         for _poll in range(30):
             asset = await client.get_asset(asset_token)
-            if not asset.get("is_skeleton", False):
-                break
+            if not asset.get("is_skeleton", False): break
             if status is not None:
-                elapsed = int(time.monotonic() - upload_started)
-                await update(f"📄 {filename}\n\n☁️ Processing upload…\n⏳ {max(1, 60 - elapsed)}s left (estimate)")
+                elapsed = int(time.monotonic() - upload_started); await update(f"📄 {filename}\n\n☁️ Processing upload…\n⏳ {max(1, 60 - elapsed)}s left (estimate)")
             await asyncio.sleep(2)
         url = str(asset.get("display_url") or "").strip()
-        if not url:
-            raise PlaybookError(str(asset.get("source_error") or "Playbook asset has no display_url"))
+        if not url: raise PlaybookError(str(asset.get("source_error") or "Playbook asset has no display_url"))
         await update(f"📄 {filename}\n\n📤 Sending to destination…\n⏳ finalizing…")
         sent = await flood(lambda: user_client.send_file(dest, url, name=filename, caption=caption(msg)))
-        for _attempt in range(3):
-            try:
-                await client.delete_asset(asset_token)
-                break
-            except Exception as exc:
-                if _attempt == 2:
-                    print(f"[Voroa] Playbook asset cleanup failed for {asset_token}: {type(exc).__name__}: {exc}", flush=True)
-                else:
-                    await asyncio.sleep(1 + _attempt)
-        if status is not None:
-            await update(f"✅ {filename}\n\n📤 Sent successfully\n⏱️ {int(time.monotonic() - started_at)}s")
+        if status is not None: await update(f"✅ {filename}\n\n📤 Sent successfully\n⏱️ {int(time.monotonic() - started_at)}s")
         return sent
     finally:
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if asset_token and client is not None:
+            for _attempt in range(3):
+                try:
+                    await client.delete_asset(asset_token); break
+                except Exception as exc:
+                    if _attempt == 2: print(f"[Voroa] Playbook asset cleanup failed for {asset_token}: {type(exc).__name__}: {exc}", flush=True)
+                    else: await asyncio.sleep(1 + _attempt)
+        try: path.unlink(missing_ok=True)
+        except OSError: pass
 
 async def send_copy(msg, uid):
     sent = await flood(lambda: user_client.send_file(uid, msg.media, caption=caption(msg)))
     if BOT_DELETE_SECONDS:
         async def later():
             await asyncio.sleep(BOT_DELETE_SECONDS)
-            try:
-                await user_client.delete_messages(sent.peer_id, [sent.id])
-            except Exception:
-                pass
-        task = asyncio.create_task(later())
-        DELETE_TASKS.add(task)
-        task.add_done_callback(DELETE_TASKS.discard)
+            try: await user_client.delete_messages(sent.peer_id, [sent.id])
+            except Exception: pass
+        task = asyncio.create_task(later()); DELETE_TASKS.add(task); task.add_done_callback(DELETE_TASKS.discard)
 
 async def process(job, status):
     async with SEM:
-        selected = [job.candidates[mid] for mid in job.candidates if mid in job.selected]
-        done = failed = 0
-        total_files = len(selected)
+        selected = [job.candidates[mid] for mid in job.candidates if mid in job.selected]; done = failed = 0; copy_failed = 0; total_files = len(selected)
         for index, msg in enumerate(selected, 1):
             filename = safe_filename(msg)
             try:
                 await status.edit_text(f"📄 {filename}\n\n🚀 Starting {index}/{total_files}\n⏳ calculating…", reply_markup=menu())
                 await send_destination(msg, job.destination, status=status, index=index, total_files=total_files)
-                await send_copy(msg, job.owner_id)
                 done += 1
+                try:
+                    await send_copy(msg, job.owner_id)
+                except Exception as exc:
+                    copy_failed += 1
+                    print(f"[Voroa] Bot-chat copy failed for {getattr(msg, 'id', '?')}: {type(exc).__name__}: {exc}", flush=True)
+                    await status.edit_text(f"✅ {filename}\n\n📤 Destination sent successfully\n⚠️ Bot-chat copy failed; destination delivery is complete.\n\n✅ Sent: {done} | ⚠️ Copy warnings: {copy_failed} | ❌ Transfer failures: {failed}", reply_markup=menu())
+                    continue
             except Exception as exc:
-                failed += 1
-                print(f"File {getattr(msg, 'id', '?')} failed: {type(exc).__name__}: {exc}", flush=True)
-                await status.edit_text(f"❌ {filename}\n\nFailed: {type(exc).__name__}: {exc}\n\n✅ Sent: {done} | ⚠️ Failed: {failed}", reply_markup=menu())
-                continue
-            await status.edit_text(f"✅ {filename}\n\nCompleted {index}/{total_files}\n✅ Sent: {done}\n⚠️ Failed: {failed}", reply_markup=menu())
-        await status.edit_text(f"✅ Completed\n\n📦 Files processed: {total_files}\n✅ Sent: {done}\n⚠️ Failed: {failed}\n\nDestination: {job.destination}", reply_markup=menu())
+                failed += 1; print(f"File {getattr(msg, 'id', '?')} failed: {type(exc).__name__}: {exc}", flush=True)
+                await status.edit_text(f"❌ {filename}\n\nFailed: {type(exc).__name__}: {exc}\n\n✅ Sent: {done} | ⚠️ Copy warnings: {copy_failed} | ❌ Transfer failures: {failed}", reply_markup=menu()); continue
+            await status.edit_text(f"✅ {filename}\n\nCompleted {index}/{total_files}\n✅ Sent: {done}\n⚠️ Copy warnings: {copy_failed}\n❌ Transfer failures: {failed}", reply_markup=menu())
+        await status.edit_text(f"✅ Completed\n\n📦 Files processed: {total_files}\n✅ Sent: {done}\n⚠️ Copy warnings: {copy_failed}\n❌ Transfer failures: {failed}\n\nDestination: {job.destination}", reply_markup=menu())
 
 @dp.message(CommandStart())
 async def start(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if not allowed(uid):
-        await message.answer("⛔ You are not authorized to use this bot.")
-        return
+    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.")
     await message.answer("HJ GROUPS Media Collector\n\nChoose a function from the buttons below or send a Telegram message link directly.", reply_markup=menu())
 
 @dp.message(Command("id"))
 async def id_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if not uid:
-        return
-    role = access_role(uid) or "not authorized"
-    await message.answer(f"🆔 Your Telegram user ID: {uid}\n\nRole: {role}", reply_markup=menu())
+    if not uid: return
+    await message.answer(f"🆔 Your Telegram user ID: {uid}\n\nRole: {access_role(uid) or 'not authorized'}", reply_markup=menu())
 
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if not allowed(uid):
-        await message.answer("⛔ You are not authorized to use this bot.")
-        return
-    extra = ""
-    if is_owner(uid):
-        extra = "\n\n👑 Owner commands:\n/grant USER_ID [days] — permanent or time-limited access\n/revoke USER_ID — remove access\n/users — list saved access"
-    await message.answer("HJ GROUPS Media Collector\n\n🔗 Scan Link — send a Telegram message link. Bulk links like .../471-480 or .../471 480 are supported.\n📦 Bulk Range — send: @channel START_ID END_ID.\n📋 Select Files — use after a scan, then send: 25,31,44.\n🎯 Destination — send @username or chat ID.\n🔐 Login — QR login.\n📱 Session — check the saved session.\n🚪 Logout — remove the saved Telegram session.\n❌ Cancel — cancel the current job or pending input." + extra, reply_markup=menu())
+    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.")
+    extra = "\n\n👑 Owner commands:\n/grant USER_ID [days]\n/revoke USER_ID\n/users" if is_owner(uid) else ""
+    await message.answer("HJ GROUPS Media Collector\n\n🔗 Scan Link — send a Telegram message link. Bulk links .../471-480 or .../471 480 are supported.\n📦 Bulk Range — send: @channel START_ID END_ID.\n📋 Select Files — use after a scan, then send: 25,31,44.\n🎯 Destination — send @username or chat ID.\n🔐 Login — QR login.\n📱 Session — check the saved session.\n🚪 Logout — remove the saved Telegram session.\n❌ Cancel — cancel the current job or pending input." + extra, reply_markup=menu())
 
 @dp.message(Command("grant"))
 async def grant_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if not is_owner(uid):
-        return await message.answer("⛔ Owner only.")
+    if not is_owner(uid): return await message.answer("⛔ Owner only.")
     parts = (message.text or "").split()
-    if len(parts) not in (2, 3) or not parts[1].isdigit() or int(parts[1]) <= 0:
-        return await message.answer("Usage: /grant USER_ID [days]\nWithout days = permanent access.", reply_markup=menu())
-    target = int(parts[1])
-    days = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else None
-    if len(parts) == 3 and (days is None or days <= 0):
-        return await message.answer("Days must be a positive number.", reply_markup=menu())
+    if len(parts) not in (2, 3) or not parts[1].isdigit() or int(parts[1]) <= 0: return await message.answer("Usage: /grant USER_ID [days]\nWithout days = permanent access.", reply_markup=menu())
+    target = int(parts[1]); days = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else None
+    if len(parts) == 3 and (days is None or days <= 0): return await message.answer("Days must be a positive number.", reply_markup=menu())
     expiry = datetime.now(timezone.utc) + timedelta(days=days) if days else None
-    await session_store.set_access(target, active=True, expires_at=expiry, role="vip")
-    ACCESS_CACHE[target] = {"user_id": target, "active": True, "expires_at": expiry, "role": "vip"}
-    label = "permanent" if expiry is None else f"until {expiry.isoformat()}"
-    await message.answer(f"✅ Access granted to {target}: {label}", reply_markup=menu())
+    await session_store.set_access(target, active=True, expires_at=expiry, role="vip"); ACCESS_CACHE[target] = {"user_id": target, "active": True, "expires_at": expiry, "role": "vip"}
+    await message.answer(f"✅ Access granted to {target}: {'permanent' if expiry is None else f' until {expiry.isoformat()}'}", reply_markup=menu())
 
 @dp.message(Command("revoke"))
 async def revoke_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if not is_owner(uid):
-        return await message.answer("⛔ Owner only.")
+    if not is_owner(uid): return await message.answer("⛔ Owner only.")
     parts = (message.text or "").split(maxsplit=1)
-    if len(parts) != 2 or not parts[1].strip().isdigit():
-        return await message.answer("Usage: /revoke USER_ID", reply_markup=menu())
+    if len(parts) != 2 or not parts[1].strip().isdigit(): return await message.answer("Usage: /revoke USER_ID", reply_markup=menu())
     target = int(parts[1].strip())
-    if target == OWNER_USER_ID:
-        return await message.answer("❌ Owner access is permanent and cannot be revoked.", reply_markup=menu())
-    await session_store.set_access(target, active=False, expires_at=None, role="user")
-    ACCESS_CACHE[target] = {"user_id": target, "active": False, "expires_at": None, "role": "user"}
+    if target == OWNER_USER_ID: return await message.answer("❌ Owner access is permanent and cannot be revoked.", reply_markup=menu())
+    await session_store.set_access(target, active=False, expires_at=None, role="user"); ACCESS_CACHE[target] = {"user_id": target, "active": False, "expires_at": None, "role": "user"}
     await message.answer(f"✅ Access revoked for {target}.", reply_markup=menu())
 
 @dp.message(Command("users"))
 async def users_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if not is_owner(uid):
-        return await message.answer("⛔ Owner only.")
-    rows = await session_store.list_access()
-    lines = []
+    if not is_owner(uid): return await message.answer("⛔ Owner only.")
+    rows = await session_store.list_access(); lines = []
     for row in sorted(rows, key=lambda x: x["user_id"]):
-        if row.get("role") == "owner":
-            status = "OWNER / PERMANENT"
-        elif not row.get("active"):
-            status = "REVOKED"
-        elif row.get("expires_at") is None:
-            status = "VIP / PERMANENT"
-        else:
-            status = f"VIP / {row['expires_at']}"
+        if row.get("role") == "owner": status = "OWNER / PERMANENT"
+        elif not row.get("active"): status = "REVOKED"
+        elif row.get("expires_at") is None: status = "VIP / PERMANENT"
+        else: status = f"VIP / {row['expires_at']}"
         lines.append(f"{row['user_id']} — {status}")
     await message.answer("👥 Saved access:\n\n" + ("\n".join(lines) if lines else "No users saved."), reply_markup=menu())
 
 async def qr_login_flow(message: Message, uid: int):
     async with LOGIN_LOCK:
-        qr_client = None
-        keep_client = False
+        qr_client = None; keep_client = False
         try:
-            qr_client = TelegramClient(StringSession(""), API_ID, API_HASH)
-            await qr_client.connect()
-            qr_login = await qr_client.qr_login()
-            wait_task = asyncio.create_task(qr_login.wait(timeout=150))
-            qr_path = Path(tempfile.gettempdir()) / f"telegram_qr_{uid}.png"
-            img = qrcode.make(qr_login.url)
-            img.save(qr_path)
-            try:
-                await message.answer_photo(FSInputFile(qr_path), caption=("🔐 Telegram QR Login\n\n1. Open Telegram on your phone.\n2. Settings → Devices → Link Desktop Device.\n3. Scan this QR code.\n\nThe QR code expires automatically. Keep this chat open until login completes."), reply_markup=menu())
+            qr_client = TelegramClient(StringSession(""), API_ID, API_HASH); await qr_client.connect(); qr_login = await qr_client.qr_login(); wait_task = asyncio.create_task(qr_login.wait(timeout=150))
+            qr_path = Path(tempfile.gettempdir()) / f"telegram_qr_{uid}.png"; qrcode.make(qr_login.url).save(qr_path)
+            try: await message.answer_photo(FSInputFile(qr_path), caption="🔐 Telegram QR Login\n\n1. Open Telegram on your phone.\n2. Settings → Devices → Link Desktop Device.\n3. Scan this QR code.\n\nThe QR code expires automatically. Keep this chat open until login completes.", reply_markup=menu())
             finally:
                 try: qr_path.unlink(missing_ok=True)
                 except OSError: pass
             try:
-                await wait_task
-                session = qr_client.session.save()
-                await session_store.set(session)
-                PENDING.pop(uid, None)
-                await message.answer("Telegram account login successful via QR. ✅", reply_markup=menu())
+                await wait_task; await session_store.set(qr_client.session.save()); PENDING.pop(uid, None); await message.answer("Telegram account login successful via QR. ✅", reply_markup=menu())
             except SessionPasswordNeededError:
-                QR_CLIENTS[uid] = qr_client
-                keep_client = True
-                PENDING[uid] = "2fa_qr"
-                await message.answer("✅ QR approved. Your Telegram account has 2FA enabled. Enter the 2FA password here or use /2fa your_password.", reply_markup=menu())
-            except asyncio.TimeoutError:
-                await message.answer("⏱️ QR code expired. Press 🔐 Login to generate a new QR code.", reply_markup=menu())
+                QR_CLIENTS[uid] = qr_client; keep_client = True; PENDING[uid] = "2fa_qr"; await message.answer("✅ QR approved. Your Telegram account has 2FA enabled. Enter the 2FA password here or use /2fa your_password.", reply_markup=menu())
+            except asyncio.TimeoutError: await message.answer("⏱️ QR code expired. Press 🔐 Login to generate a new QR code.", reply_markup=menu())
             except (AuthKeyUnregisteredError, AuthKeyInvalidError, SessionRevokedError):
-                QR_CLIENTS.pop(uid, None); PENDING.pop(uid, None)
-                await message.answer("⚠️ The temporary Telegram QR session was invalidated. Press 🔐 Login and scan a new QR code.", reply_markup=menu())
+                QR_CLIENTS.pop(uid, None); PENDING.pop(uid, None); await message.answer("⚠️ The temporary Telegram QR session was invalidated. Press 🔐 Login and scan a new QR code.", reply_markup=menu())
             except Exception as exc:
-                QR_CLIENTS.pop(uid, None); PENDING.pop(uid, None)
-                await message.answer(f"QR login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
+                QR_CLIENTS.pop(uid, None); PENDING.pop(uid, None); await message.answer(f"QR login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
         except Exception as exc:
-            QR_CLIENTS.pop(uid, None); PENDING.pop(uid, None)
-            await message.answer(f"Could not start QR login: {type(exc).__name__}: {exc}", reply_markup=menu())
+            QR_CLIENTS.pop(uid, None); PENDING.pop(uid, None); await message.answer(f"Could not start QR login: {type(exc).__name__}: {exc}", reply_markup=menu())
         finally:
             if qr_client is not None and not keep_client:
                 try:
@@ -611,9 +451,7 @@ async def qr_login_flow(message: Message, uid: int):
 @dp.message(Command("login"))
 async def login_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if not allowed(uid):
-        await message.answer("⛔ You are not authorized to use this bot.")
-        return
+    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.")
     await qr_login_flow(message, uid)
 
 @dp.message(Command("otp"))
@@ -621,37 +459,25 @@ async def otp_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
     if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.")
     parts = (message.text or "").split(maxsplit=1)
-    if len(parts) != 2:
-        PENDING[uid] = "otp"; return await message.answer("Enter the OTP number, for example 12345.", reply_markup=menu())
+    if len(parts) != 2: PENDING[uid] = "otp"; return await message.answer("Enter the OTP number, for example 12345.", reply_markup=menu())
     pending = await session_store.get_login(uid)
-    if not pending or not pending.get("phone") or not pending.get("phone_code_hash") or not pending.get("session_string"):
-        return await message.answer("No login is waiting. Use 🔐 Login first.", reply_markup=menu())
+    if not pending or not pending.get("phone") or not pending.get("phone_code_hash") or not pending.get("session_string"): return await message.answer("No login is waiting. Use 🔐 Login first.", reply_markup=menu())
     try:
-        await rebuild(pending["session_string"])
-        await user_client.sign_in(pending["phone"], parts[1].strip(), phone_code_hash=pending["phone_code_hash"])
-        await session_store.set(user_client.session.save()); await session_store.clear_login(uid); PENDING.pop(uid, None)
-        await message.answer("Telegram account login successful. ✅", reply_markup=menu())
-    except SessionPasswordNeededError:
-        PENDING[uid] = "2fa"; await message.answer("2FA enabled. Enter the Telegram 2FA password.", reply_markup=menu())
-    except Exception as exc:
-        await message.answer(f"OTP login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
+        await rebuild(pending["session_string"]); await user_client.sign_in(pending["phone"], parts[1].strip(), phone_code_hash=pending["phone_code_hash"]); await session_store.set(user_client.session.save()); await session_store.clear_login(uid); PENDING.pop(uid, None); await message.answer("Telegram account login successful. ✅", reply_markup=menu())
+    except SessionPasswordNeededError: PENDING[uid] = "2fa"; await message.answer("2FA enabled. Enter the Telegram 2FA password.", reply_markup=menu())
+    except Exception as exc: await message.answer(f"OTP login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
 
 @dp.message(Command("2fa"))
 async def twofa_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.")
+    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.", reply_markup=menu())
     parts = (message.text or "").split(maxsplit=1)
-    if len(parts) != 2:
-        PENDING[uid] = PENDING.get(uid) or "2fa"; return await message.answer("Enter your Telegram 2FA password.", reply_markup=menu())
+    if len(parts) != 2: PENDING[uid] = PENDING.get(uid) or "2fa"; return await message.answer("Enter your Telegram 2FA password.", reply_markup=menu())
     if PENDING.get(uid) == "2fa_qr":
         qr_client = QR_CLIENTS.get(uid)
-        if qr_client is None or not qr_client.is_connected():
-            QR_CLIENTS.pop(uid, None); PENDING.pop(uid, None)
-            return await message.answer("⚠️ QR login session is no longer active. Press 🔐 Login and scan a new QR code.", reply_markup=menu())
+        if qr_client is None or not qr_client.is_connected(): QR_CLIENTS.pop(uid, None); PENDING.pop(uid, None); return await message.answer("⚠️ QR login session is no longer active. Press 🔐 Login and scan a new QR code.", reply_markup=menu())
         try:
-            await qr_client.sign_in(password=parts[1].strip())
-            await session_store.set(qr_client.session.save())
-            PENDING.pop(uid, None); QR_CLIENTS.pop(uid, None)
+            await qr_client.sign_in(password=parts[1].strip()); await session_store.set(qr_client.session.save()); PENDING.pop(uid, None); QR_CLIENTS.pop(uid, None)
             try:
                 if qr_client.is_connected(): await qr_client.disconnect()
             except Exception: pass
@@ -662,34 +488,27 @@ async def twofa_cmd(message: Message):
                 if qr_client.is_connected(): await qr_client.disconnect()
             except Exception: pass
             await message.answer("⚠️ Telegram invalidated the temporary QR session. Press 🔐 Login and scan a new QR code.", reply_markup=menu())
-        except Exception as exc:
-            await message.answer(f"2FA login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
+        except Exception as exc: await message.answer(f"2FA login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
         return
     pending = await session_store.get_login(uid)
-    if not pending or not pending.get("session_string"):
-        return await message.answer("No 2FA login is waiting. Use 🔐 Login first.", reply_markup=menu())
+    if not pending or not pending.get("session_string"): return await message.answer("No 2FA login is waiting. Use 🔐 Login first.", reply_markup=menu())
     try:
-        await rebuild(pending["session_string"]); await user_client.sign_in(password=parts[1]); await session_store.set(user_client.session.save()); await session_store.clear_login(uid); PENDING.pop(uid, None)
-        await message.answer("Telegram account login successful. ✅", reply_markup=menu())
-    except Exception as exc:
-        await message.answer(f"2FA login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
+        await rebuild(pending["session_string"]); await user_client.sign_in(password=parts[1]); await session_store.set(user_client.session.save()); await session_store.clear_login(uid); PENDING.pop(uid, None); await message.answer("Telegram account login successful. ✅", reply_markup=menu())
+    except Exception as exc: await message.answer(f"2FA login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
 
 @dp.message(Command("logout"))
 async def logout_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.")
+    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.", reply_markup=menu())
     try:
-        if user_client.is_connected():
-            await user_client.log_out()
-    except Exception as exc:
-        print(f"[Voroa] Telegram logout request failed: {type(exc).__name__}: {exc}", flush=True)
+        if user_client.is_connected(): await user_client.log_out()
+    except Exception as exc: print(f"[Voroa] Telegram logout request failed: {type(exc).__name__}: {exc}", flush=True)
     finally:
         await session_store.clear(); await session_store.clear_login(uid)
         try:
             if user_client.is_connected(): await user_client.disconnect()
         except Exception: pass
-    PENDING.pop(uid, None)
-    qr_client = QR_CLIENTS.pop(uid, None)
+    PENDING.pop(uid, None); qr_client = QR_CLIENTS.pop(uid, None)
     if qr_client is not None:
         try:
             if qr_client.is_connected(): await qr_client.disconnect()
@@ -699,36 +518,30 @@ async def logout_cmd(message: Message):
 @dp.message(Command("session"))
 async def session_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.")
+    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.", reply_markup=menu())
     session = await saved_session()
     if not session: return await message.answer("No Telegram user session. Use 🔐 Login.", reply_markup=menu())
     try:
         if not user_client.is_connected(): await rebuild(session)
-        if await user_client.is_user_authorized():
-            me = await user_client.get_me(); await message.answer(f"Session active: {getattr(me, 'username', None) or me.id} ✅", reply_markup=menu())
+        if await user_client.is_user_authorized(): me = await user_client.get_me(); await message.answer(f"Session active: {getattr(me, 'username', None) or me.id} ✅", reply_markup=menu())
         else: await message.answer("Session is not authorized. Use 🔐 Login.", reply_markup=menu())
-    except Exception as exc:
-        await message.answer(f"Session check failed: {type(exc).__name__}: {exc}", reply_markup=menu())
+    except Exception as exc: await message.answer(f"Session check failed: {type(exc).__name__}: {exc}", reply_markup=menu())
 
 @dp.message(Command("setdestination"))
 async def setdest_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.")
+    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.", reply_markup=menu())
     parts = (message.text or "").split(maxsplit=1)
-    if len(parts) != 2:
-        PENDING[uid] = "destination"; return await message.answer("🎯 Send the destination username or chat ID, for example @mychannel or -1001234567890.", reply_markup=menu())
-    try:
-        value = await set_destination(uid, parts[1])
-    except Exception as exc:
-        return await message.answer(f"❌ Destination was not saved permanently: {type(exc).__name__}: {exc}", reply_markup=menu())
+    if len(parts) != 2: PENDING[uid] = "destination"; return await message.answer("🎯 Send the destination username or chat ID, for example @mychannel or -1001234567890.", reply_markup=menu())
+    try: value = await set_destination(uid, parts[1])
+    except Exception as exc: return await message.answer(f"❌ Destination was not saved permanently: {type(exc).__name__}: {exc}", reply_markup=menu())
     PENDING.pop(uid, None); await message.answer(f"✅ Permanent destination saved: {value}\n\nIt will survive bot code updates/redeploys.", reply_markup=menu())
 
 @dp.message(Command("cancel"))
 async def cancel_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.")
-    JOBS.pop(uid, None); PENDING.pop(uid, None)
-    qr_client = QR_CLIENTS.pop(uid, None)
+    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.", reply_markup=menu())
+    JOBS.pop(uid, None); PENDING.pop(uid, None); qr_client = QR_CLIENTS.pop(uid, None)
     if qr_client is not None:
         try:
             if qr_client.is_connected(): await qr_client.disconnect()
@@ -740,28 +553,21 @@ async def range_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
     if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.", reply_markup=menu())
     parts = (message.text or "").split()
-    if len(parts) != 4:
-        PENDING[uid] = "range"; return await message.answer("📦 Send: @channel START_ID END_ID", reply_markup=menu())
+    if len(parts) != 4: PENDING[uid] = "range"; return await message.answer("📦 Send: @channel START_ID END_ID", reply_markup=menu())
     peer = parts[1].strip()
     try:
         start_id, end_id = int(parts[2]), int(parts[3])
         if start_id <= 0 or end_id < start_id: raise ValueError("Invalid message ID range.")
         if end_id - start_id + 1 > MAX_BULK_MESSAGES: raise ValueError(f"Maximum range is {MAX_BULK_MESSAGES} messages.")
-        await ensure_user_client()
-        source = await asyncio.wait_for(resolve_message_peer(peer), timeout=SCAN_TIMEOUT_SECONDS)
-        status = await message.answer("🔎 Scanning messages...", reply_markup=menu())
-        msgs = await asyncio.wait_for(user_client.get_messages(source, ids=list(range(start_id, end_id + 1))), timeout=SCAN_TIMEOUT_SECONDS)
-        PENDING.pop(uid, None)
-        await create_job(uid, source, [msg for msg in msgs if msg and getattr(msg, "media", None)], status)
+        await ensure_user_client(); source = await asyncio.wait_for(resolve_message_peer(peer), timeout=SCAN_TIMEOUT_SECONDS); status = await message.answer("🔎 Scanning messages...", reply_markup=menu()); msgs = await asyncio.wait_for(user_client.get_messages(source, ids=list(range(start_id, end_id + 1))), timeout=SCAN_TIMEOUT_SECONDS); PENDING.pop(uid, None); await create_job(uid, source, [msg for msg in msgs if msg and getattr(msg, "media", None)], status)
     except asyncio.TimeoutError: await message.answer(f"⏱️ Telegram did not respond within {SCAN_TIMEOUT_SECONDS} seconds. Please try the range again.", reply_markup=menu())
     except (ValueError, RPCError) as exc: await message.answer(f"Could not scan range: {exc}", reply_markup=menu())
-    except Exception as exc:
-        print(f"Range scan failed: {type(exc).__name__}: {exc}", flush=True); await message.answer(f"❌ Range scan failed: {type(exc).__name__}: {exc}", reply_markup=menu())
+    except Exception as exc: print(f"Range scan failed: {type(exc).__name__}: {exc}", flush=True); await message.answer(f"❌ Range scan failed: {type(exc).__name__}: {exc}", reply_markup=menu())
 
 @dp.message(Command("select"))
 async def select_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.")
+    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.", reply_markup=menu())
     job = JOBS.get(uid); parts = (message.text or "").split(maxsplit=1)
     if not job: return await message.answer("No active scan. Use 🔗 Scan Link or 📦 Bulk Range first.", reply_markup=menu())
     if len(parts) != 2: PENDING[uid] = "select"; return await message.answer("📋 Send the file message IDs as: 25,31,44", reply_markup=menu())
@@ -769,8 +575,7 @@ async def select_cmd(message: Message):
     except ValueError: return await message.answer("Message IDs must be comma-separated numbers.", reply_markup=menu())
     missing = ids - set(job.candidates)
     if missing: return await message.answer("IDs not in current scan: " + ", ".join(map(str, sorted(missing)[:20])), reply_markup=menu())
-    job.selected = ids; PENDING.pop(uid, None)
-    await message.answer(f"Selected {len(ids)} file(s).\nTotal size: {size(sum(media_size(job.candidates[i]) for i in ids))}\n\nDestination: {job.destination}\n\nConfirm?", reply_markup=confirm_menu(uid))
+    job.selected = ids; PENDING.pop(uid, None); await message.answer(f"Selected {len(ids)} file(s).\nTotal size: {size(sum(media_size(job.candidates[i]) for i in ids))}\n\nDestination: {job.destination}\n\nConfirm?", reply_markup=confirm_menu(uid))
 
 @dp.message(F.text == "🔐 Login")
 async def button_login(message: Message): return await login_cmd(message.model_copy(update={"text": "/login"}))
@@ -799,7 +604,6 @@ async def text_handler(message: Message):
     uid = message.from_user.id if message.from_user else None
     if not allowed(uid): return
     text = (message.text or "").strip(); action = PENDING.get(uid)
-    if action == "phone": return await login_cmd(message.model_copy(update={"text": f"/login {text}"}))
     if action == "otp": return await otp_cmd(message.model_copy(update={"text": f"/otp {text}"}))
     if action in {"2fa", "2fa_qr"}: return await twofa_cmd(message.model_copy(update={"text": f"/2fa {text}"}))
     if action == "destination": return await setdest_cmd(message.model_copy(update={"text": f"/setdestination {text}"}))
@@ -811,29 +615,21 @@ async def text_handler(message: Message):
     if not re.match(r"^https?://(?:www\.)?t\.me/", text): return await message.answer("Send a Telegram t.me message link or use the buttons below.", reply_markup=menu())
     await load_destination(uid)
     if not destination(uid): return await message.answer("Set a destination first with 🎯 Destination.", reply_markup=menu())
-    bulk = parse_bulk_link(text)
-    status = await message.answer("🔎 Starting bulk scan…" if bulk else "🔎 Starting scan…", reply_markup=menu())
+    bulk = parse_bulk_link(text); status = await message.answer("🔎 Starting bulk scan…" if bulk else "🔎 Starting scan…", reply_markup=menu())
     async def safe_status(text):
         nonlocal status
-        try:
-            await asyncio.wait_for(status.edit_text(text, reply_markup=None), timeout=8)
-            print(f"[Voroa] SCAN STATUS: {text.replace(chr(10), ' | ')}", flush=True); return
+        try: await asyncio.wait_for(status.edit_text(text, reply_markup=None), timeout=8); print(f"[Voroa] SCAN STATUS: {text.replace(chr(10), ' | ')}", flush=True); return
         except Exception as exc: print(f"[Voroa] Status edit failed: {type(exc).__name__}: {exc}", flush=True)
-        try:
-            status = await message.answer(text); print(f"[Voroa] SCAN STATUS FALLBACK: {text.replace(chr(10), ' | ')}", flush=True)
+        try: status = await message.answer(text); print(f"[Voroa] SCAN STATUS FALLBACK: {text.replace(chr(10), ' | ')}", flush=True)
         except Exception as exc: print(f"[Voroa] Status fallback send failed: {type(exc).__name__}: {exc}", flush=True)
     async def bounded(coro, timeout=SCAN_TIMEOUT_SECONDS):
         task = asyncio.create_task(coro)
-        try:
-            return await asyncio.wait_for(task, timeout=timeout)
+        try: return await asyncio.wait_for(task, timeout=timeout)
         except asyncio.TimeoutError:
             task.cancel()
-            try:
-                await asyncio.wait_for(task, timeout=2)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
-            except Exception:
-                pass
+            try: await asyncio.wait_for(task, timeout=2)
+            except (asyncio.CancelledError, asyncio.TimeoutError): pass
+            except Exception: pass
             try:
                 if user_client.is_connected(): await asyncio.wait_for(user_client.disconnect(), timeout=5)
             except Exception: pass
@@ -841,17 +637,13 @@ async def text_handler(message: Message):
     try:
         await safe_status("🔐 Checking Telegram session…"); await bounded(ensure_user_client()); await safe_status("✅ Telegram session ready.")
         if bulk:
-            peer, start_id, end_id = bulk
-            await safe_status(f"🔎 Resolving Telegram channel…\n📦 Range: {start_id}–{end_id}"); source = await bounded(resolve_message_peer(peer))
-            await safe_status(f"🔎 Fetching messages {start_id}–{end_id}…"); msgs = await bounded(user_client.get_messages(source, ids=list(range(start_id, end_id + 1))))
-            media_msgs = [msg for msg in msgs if msg and getattr(msg, "media", None)]; await create_job(uid, source, media_msgs, status); return
+            peer, start_id, end_id = bulk; await safe_status(f"🔎 Resolving Telegram channel…\n📦 Range: {start_id}–{end_id}"); source = await bounded(resolve_message_peer(peer)); await safe_status(f"🔎 Fetching messages {start_id}–{end_id}…"); msgs = await bounded(user_client.get_messages(source, ids=list(range(start_id, end_id + 1)))); media_msgs = [msg for msg in msgs if msg and getattr(msg, "media", None)]; await create_job(uid, source, media_msgs, status); return
         peer, mid = parse_link(text); await safe_status(f"🔎 Resolving Telegram channel…\n📌 Message: {mid}"); source = await bounded(resolve_message_peer(peer)); await safe_status(f"🔎 Fetching message {mid}…"); msg = await bounded(user_client.get_messages(source, ids=mid))
         if not msg or not getattr(msg, "media", None): return await safe_status("That message does not contain downloadable media.")
         await create_job(uid, source, [msg], status)
     except asyncio.TimeoutError: await safe_status(f"⏱️ Telegram scan timed out after {SCAN_TIMEOUT_SECONDS} seconds.\n\nThe scan was stopped safely instead of hanging. Check that the logged-in Telegram account can access this channel, then try again.")
     except (ValueError, RPCError) as exc: await safe_status(f"Could not resolve that message: {exc}")
-    except Exception as exc:
-        print(f"Scan failed: {type(exc).__name__}: {exc}", flush=True); await safe_status(f"❌ Scan failed: {type(exc).__name__}: {exc}")
+    except Exception as exc: print(f"Scan failed: {type(exc).__name__}: {exc}", flush=True); await safe_status(f"❌ Scan failed: {type(exc).__name__}: {exc}")
 
 @dp.callback_query(F.data.startswith("pick:"))
 async def pick(callback: CallbackQuery):
@@ -905,8 +697,7 @@ async def cancel_callback(callback: CallbackQuery):
     if not allowed(uid): return await callback.answer("Not authorized", show_alert=True)
     owner = int(callback.data.split(":", 1)[1])
     if owner == uid:
-        JOBS.pop(uid, None); PENDING.pop(uid, None)
-        qr_client = QR_CLIENTS.pop(uid, None)
+        JOBS.pop(uid, None); PENDING.pop(uid, None); qr_client = QR_CLIENTS.pop(uid, None)
         if qr_client is not None:
             try:
                 if qr_client.is_connected(): await qr_client.disconnect()
@@ -914,70 +705,43 @@ async def cancel_callback(callback: CallbackQuery):
     await callback.message.edit_text("❌ Cancelled.", reply_markup=menu()); await callback.answer()
 
 async def configure_command_menu():
-    general_commands = [
-        BotCommand(command="start", description="Open main menu"), BotCommand(command="id", description="Show your Telegram user ID"), BotCommand(command="help", description="Show help"),
-        BotCommand(command="login", description="Login Telegram account"), BotCommand(command="otp", description="Submit Telegram OTP"),
-        BotCommand(command="2fa", description="Submit Telegram 2FA"), BotCommand(command="session", description="Check saved session"),
-        BotCommand(command="setdestination", description="Set delivery destination"), BotCommand(command="range", description="Scan a message range"),
-        BotCommand(command="select", description="Select scanned files"), BotCommand(command="cancel", description="Cancel current job"),
-        BotCommand(command="logout", description="Logout Telegram account"),
-    ]
+    general_commands = [BotCommand(command="start", description="Open main menu"), BotCommand(command="id", description="Show your Telegram user ID"), BotCommand(command="help", description="Show help"), BotCommand(command="login", description="Login Telegram account"), BotCommand(command="otp", description="Submit Telegram OTP"), BotCommand(command="2fa", description="Submit Telegram 2FA"), BotCommand(command="session", description="Check saved session"), BotCommand(command="setdestination", description="Set delivery destination"), BotCommand(command="range", description="Scan a message range"), BotCommand(command="select", description="Select scanned files"), BotCommand(command="cancel", description="Cancel current job"), BotCommand(command="logout", description="Logout Telegram account")]
     await bot.set_my_commands(general_commands)
     if OWNER_USER_ID:
-        owner_commands = general_commands + [
-            BotCommand(command="grant", description="Owner: grant access"),
-            BotCommand(command="revoke", description="Owner: revoke access"),
-            BotCommand(command="users", description="Owner: list access"),
-        ]
-        await bot.set_my_commands(owner_commands, scope=BotCommandScopeChat(chat_id=OWNER_USER_ID))
-    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-    print("Telegram command menu configured with owner-only command scope.", flush=True)
+        await bot.set_my_commands(general_commands + [BotCommand(command="grant", description="Owner: grant access"), BotCommand(command="revoke", description="Owner: revoke access"), BotCommand(command="users", description="Owner: list access")], scope=BotCommandScopeChat(chat_id=OWNER_USER_ID))
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands()); print("Telegram command menu configured with owner-only command scope.", flush=True)
 
 async def main():
-    if not API_ID or not API_HASH or not BOT_TOKEN:
-        raise RuntimeError("Set Telegram API credentials.")
-    if not ALLOWED_USER_IDS and not EXPLICIT_OWNER_ID:
-        raise RuntimeError("Set TELEGRAM_ALLOWED_USER_IDS or VOROA_OWNER_USER_ID.")
-    mongo_ok = await session_store.ping()
-    print(f"[Voroa] Storage mode: {'MongoDB' if mongo_ok else 'local fallback'}", flush=True)
-    try:
-        await load_access_state()
+    if not API_ID or not API_HASH or not BOT_TOKEN: raise RuntimeError("Set Telegram API credentials.")
+    if not ALLOWED_USER_IDS and not EXPLICIT_OWNER_ID: raise RuntimeError("Set TELEGRAM_ALLOWED_USER_IDS or VOROA_OWNER_USER_ID.")
+    mongo_ok = await session_store.ping(); print(f"[Voroa] Storage mode: {'MongoDB' if mongo_ok else 'local fallback'}", flush=True)
+    try: await load_access_state()
     except Exception as exc:
         print(f"[Voroa] Access-state initialization failed: {type(exc).__name__}: {exc}", flush=True)
-        if not OWNER_USER_ID:
-            raise
-    try:
-        await configure_command_menu()
-    except Exception as exc:
-        print(f"[Voroa] Command menu setup failed; continuing to polling: {type(exc).__name__}: {exc}", flush=True)
+        if not OWNER_USER_ID: raise
+    try: await configure_command_menu()
+    except Exception as exc: print(f"[Voroa] Command menu setup failed; continuing to polling: {type(exc).__name__}: {exc}", flush=True)
     for uid in ALLOWED_USER_IDS:
-        try:
-            await load_destination(uid)
-        except Exception as exc:
-            print(f"[Voroa] Destination preload failed for {uid}: {type(exc).__name__}: {exc}", flush=True)
+        try: await load_destination(uid)
+        except Exception as exc: print(f"[Voroa] Destination preload failed for {uid}: {type(exc).__name__}: {exc}", flush=True)
     session = await saved_session()
     if session:
         try:
             await rebuild(session)
-            if await user_client.is_user_authorized():
-                me = await user_client.get_me(); print(f"Telethon connected as {getattr(me, 'username', None) or me.id}", flush=True)
-            else:
-                print("Saved Telegram session is not authorized; use /login", flush=True)
+            if await user_client.is_user_authorized(): me = await user_client.get_me(); print(f"Telethon connected as {getattr(me, 'username', None) or me.id}", flush=True)
+            else: print("Saved Telegram session is not authorized; use /login", flush=True)
         except Exception as exc:
             print(f"[Voroa] Saved Telegram session could not be restored; bot will still start: {type(exc).__name__}: {exc}", flush=True)
             try:
                 if user_client.is_connected(): await user_client.disconnect()
             except Exception: pass
-    else:
-        print("Telethon user session not configured; use /login", flush=True)
-    try:
-        await dp.start_polling(bot)
+    else: print("Telethon user session not configured; use /login", flush=True)
+    try: await dp.start_polling(bot)
     finally:
         for task in list(DELETE_TASKS): task.cancel()
         if DELETE_TASKS: await asyncio.gather(*DELETE_TASKS, return_exceptions=True)
         try:
             if user_client.is_connected(): await user_client.disconnect()
-        finally:
-            await session_store.close(); await bot.session.close()
+        finally: await session_store.close(); await bot.session.close()
 
 if __name__ == "__main__": asyncio.run(main())
