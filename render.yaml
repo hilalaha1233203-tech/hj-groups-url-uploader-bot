@@ -37,3 +37,11 @@ services:
         value: "https://api.playbook.com/v1"
       - key: PLAYBOOK_HTTP_TIMEOUT
         value: "120"
+      - key: TELEGRAM_SESSION_DB_URI
+        sync: false
+      - key: TELEGRAM_SESSION_DB_NAME
+        value: "hj_groups_url_uploader"
+      - key: TELEGRAM_SESSION_COLLECTION
+        value: "telegram_sessions"
+      - key: TELEGRAM_TEMP_DIR
+        value: "/tmp/telegram-media"
