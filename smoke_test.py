@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parent
 BOT = (ROOT / "telegram_bot.py").read_text(encoding="utf-8")
 STORE = (ROOT / "telegram_session_store.py").read_text(encoding="utf-8")
 PLAYBOOK = (ROOT / "playbook_client.py").read_text(encoding="utf-8")
+START = (ROOT / "start.py").read_text(encoding="utf-8")
 
 for path in ("telegram_bot.py", "telegram_session_store.py", "playbook_client.py", "start.py"):
     compile((ROOT / path).read_text(encoding="utf-8"), path, "exec")
@@ -84,6 +85,15 @@ assert "command=\"grant\"" in BOT
 assert "command=\"revoke\"" in BOT
 assert "command=\"users\"" in BOT
 
+assert "class _ProgressStatus:" in START
+assert "original_make_progress_callback = app[\"make_progress_callback\"]" in START
+assert "patched_make_progress_callback" in START
+assert "status.progress_task = state[\"task\"]" in START
+assert "task.cancel()" in START
+assert "await asyncio.gather(task, return_exceptions=True)" in START
+assert 'app["make_progress_callback"] = patched_make_progress_callback' in START
+assert 'app["send_destination"] = patched_send_destination' in START
+
 assert "assets/upload_prepare" in PLAYBOOK
 assert "assets/upload_complete" in PLAYBOOK
 assert "x-goog-resumable" in PLAYBOOK
@@ -94,4 +104,4 @@ assert "x-amz-meta-extension" in PLAYBOOK
 assert "x-amz-meta-encrypted-organization-metadata" in PLAYBOOK
 assert "class ProgressFileStream(httpx.AsyncByteStream)" in PLAYBOOK
 
-print("Voroa smoke checks: PASS (syntax + parsers + range + filenames + access + single-owner + command scoping + persistence recovery + Playbook contract assertions)")
+print("Voroa smoke checks: PASS (syntax + parsers + range + filenames + access + single-owner + command scoping + persistence recovery + live-progress wrapper + Playbook contract assertions)")
