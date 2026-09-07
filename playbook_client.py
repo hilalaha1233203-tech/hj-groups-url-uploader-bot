@@ -107,7 +107,8 @@ class PlaybookClient:
         return str(token)
 
     async def get_asset(self, asset_token: str) -> dict[str, Any]:
-        return await self._request("GET", f"assets/{asset_token}")
+        response = await self._request("GET", f"assets/{asset_token}")
+        return response.get("data") or response
 
     async def delete_asset(self, asset_token: str) -> None:
         await self._request("DELETE", f"assets/{asset_token}")
