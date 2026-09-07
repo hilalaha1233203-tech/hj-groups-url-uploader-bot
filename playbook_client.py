@@ -106,6 +106,9 @@ class PlaybookClient:
             raise PlaybookError("Playbook upload completed without an asset token")
         return str(token)
 
+    async def get_asset(self, asset_token: str) -> dict[str, Any]:
+        return await self._request("GET", f"assets/{asset_token}")
+
     async def delete_asset(self, asset_token: str) -> None:
         await self._request("DELETE", f"assets/{asset_token}")
 
