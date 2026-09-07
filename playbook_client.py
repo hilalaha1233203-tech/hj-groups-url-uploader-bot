@@ -25,6 +25,26 @@ class PlaybookError(RuntimeError):
     pass
 
 
+class ProgressFileStream(httpx.AsyncByteStream):
+    def __init__(self, path: Path, total: int, callback=None, chunk_size: int = 1024 * 1024) -> None:
+        self.path = path
+        self.total = total
+        self.callback = callback
+        self.chunk_size = chunk_size
+
+    async def __aiter__(self):
+        sent = 0
+        with self.path.open("rb") as stream:
+            while True:
+                chunk = stream.read(self.chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+                sent += len(chunk)
+                if self.callback:
+                    self.callback(sent, self.total)
+
+
 class PlaybookClient:
     def __init__(self, token: str = TOKEN, org_slug: str = ORG_SLUG) -> None:
         if not token or not org_slug:
@@ -67,17 +87,21 @@ class PlaybookClient:
                     init_headers["x-goog-meta-encrypted-organization-metadata"] = encrypted
                 if extension:
                     init_headers["x-goog-meta-extension"] = extension
-                with path.open("rb") as stream:
-                    init = await client.post(upload_url, headers=init_headers)
+                init = await client.post(upload_url, headers=init_headers)
                 init.raise_for_status()
                 session_url = init.headers.get("Location")
                 if not session_url:
                     raise PlaybookError("Playbook GCS upload did not return a session URL")
-                with path.open("rb") as stream:
-                    upload = await client.put(session_url, headers={"Content-Type": media_type}, content=stream)
+                upload_headers = {"Content-Type": media_type, "Content-Length": str(size)}
+                upload = await client.put(
+                    session_url,
+                    headers=upload_headers,
+                    content=ProgressFileStream(path, size, progress_callback),
+                )
                 upload.raise_for_status()
             elif provider == "backblaze" and data.get("multipart_upload_id") and data.get("parts"):
                 with path.open("rb") as stream:
+                    uploaded = 0
                     for part in data["parts"]:
                         part_number = int(part["part_number"])
                         part_size = int(data["part_size"])
@@ -85,14 +109,21 @@ class PlaybookClient:
                         chunk = stream.read(part_size)
                         response = await client.put(part["url"], content=chunk)
                         response.raise_for_status()
+                        uploaded += len(chunk)
+                        if progress_callback:
+                            progress_callback(uploaded, size)
             else:
                 headers = {"Content-Type": media_type}
                 for key in ("x-amz-meta-extension", "x-amz-meta-encrypted-organization-metadata"):
                     value = data.get(key.replace("x-amz-meta-", ""))
                     if value:
                         headers[key] = value
-                with path.open("rb") as stream:
-                    upload = await client.put(upload_url, headers=headers, content=stream)
+                headers["Content-Length"] = str(size)
+                upload = await client.put(
+                    upload_url,
+                    headers=headers,
+                    content=ProgressFileStream(path, size, progress_callback),
+                )
                 upload.raise_for_status()
 
         completed = await self._request(
