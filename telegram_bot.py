@@ -16,6 +16,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     FSInputFile,
     BotCommand,
+    BotCommandScopeChat,
     MenuButtonCommands,
 )
 from telethon import TelegramClient
@@ -129,7 +130,7 @@ async def load_access_state():
         existing = ACCESS_CACHE.get(uid)
         if not existing:
             await session_store.set_access(uid, active=True, expires_at=None, role="user")
-            ACCESS_CACHE[uid] = {"user_id": uid, "active": True, "expires_at": None, "role": "user"}
+            ACCESS_CACHE[uid] = {"user_id": uid, "active": True, "expires_at": None, "role":"user"}
 
 def load_state():
     try:
@@ -144,8 +145,8 @@ def save_state():
     try:
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         STATE_FILE.write_text(json.dumps(STATE, indent=2), encoding="utf-8")
-    except (OSError, TypeError):
-        pass
+    except (OSError, TypeError) as exc:
+        print(f"[Voroa] Local destination state write failed: {type(exc).__name__}: {exc}", flush=True)
 
 def destination(uid):
     return (DESTINATIONS.get(str(uid)) or STATE.get(str(uid)) or ENV_DESTINATIONS.get(str(uid)) or DEFAULT_DESTINATION).strip()
@@ -731,7 +732,7 @@ async def cancel_cmd(message: Message):
 @dp.message(Command("range"))
 async def range_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.")
+    if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.", reply_markup=menu())
     parts = (message.text or "").split()
     if len(parts) != 4:
         PENDING[uid] = "range"; return await message.answer("📦 Send: @channel START_ID END_ID", reply_markup=menu())
@@ -907,16 +908,24 @@ async def cancel_callback(callback: CallbackQuery):
     await callback.message.edit_text("❌ Cancelled.", reply_markup=menu()); await callback.answer()
 
 async def configure_command_menu():
-    commands = [
+    general_commands = [
         BotCommand(command="start", description="Open main menu"), BotCommand(command="id", description="Show your Telegram user ID"), BotCommand(command="help", description="Show help"),
         BotCommand(command="login", description="Login Telegram account"), BotCommand(command="otp", description="Submit Telegram OTP"),
         BotCommand(command="2fa", description="Submit Telegram 2FA"), BotCommand(command="session", description="Check saved session"),
         BotCommand(command="setdestination", description="Set delivery destination"), BotCommand(command="range", description="Scan a message range"),
         BotCommand(command="select", description="Select scanned files"), BotCommand(command="cancel", description="Cancel current job"),
-        BotCommand(command="logout", description="Logout Telegram account"), BotCommand(command="grant", description="Owner: grant access"),
-        BotCommand(command="revoke", description="Owner: revoke access"), BotCommand(command="users", description="Owner: list access"),
+        BotCommand(command="logout", description="Logout Telegram account"),
     ]
-    await bot.set_my_commands(commands); await bot.set_chat_menu_button(menu_button=MenuButtonCommands()); print("Telegram command menu configured.", flush=True)
+    await bot.set_my_commands(general_commands)
+    if OWNER_USER_ID:
+        owner_commands = general_commands + [
+            BotCommand(command="grant", description="Owner: grant access"),
+            BotCommand(command="revoke", description="Owner: revoke access"),
+            BotCommand(command="users", description="Owner: list access"),
+        ]
+        await bot.set_my_commands(owner_commands, scope=BotCommandScopeChat(chat_id=OWNER_USER_ID))
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    print("Telegram command menu configured with owner-only command scope.", flush=True)
 
 async def main():
     if not API_ID or not API_HASH or not BOT_TOKEN:
