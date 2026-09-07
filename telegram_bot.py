@@ -64,9 +64,20 @@ class Job:
     selected: set[int]
 
 def menu():
-    # Functions are exposed through Telegram's command menu only.
-    # Never attach a ReplyKeyboard to messages.
-    return None
+    # Persistent main function keyboard. Inline keyboards are used for scan/file
+    # selection; this reply keyboard remains available for the main functions.
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔗 Scan Link"), KeyboardButton(text="📦 Bulk Range")],
+            [KeyboardButton(text="🎯 Destination"), KeyboardButton(text="📋 Select Files")],
+            [KeyboardButton(text="🔐 Login"), KeyboardButton(text="📱 Session")],
+            [KeyboardButton(text="🚪 Logout"), KeyboardButton(text="❌ Cancel")],
+            [KeyboardButton(text="ℹ️ Help")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Choose a function…",
+    )
 
 def allowed(uid):
     return bool(uid and uid in ALLOWED_USER_IDS)
@@ -819,6 +830,7 @@ async def text_handler(message: Message):
     try:
         await safe_status("🔐 Checking Telegram session…")
         await bounded(ensure_user_client())
+        await safe_status("✅ Telegram session ready.")
         if bulk:
             peer, start_id, end_id = bulk
             await safe_status(f"🔎 Resolving Telegram channel…\n📦 Range: {start_id}–{end_id}")
@@ -843,7 +855,7 @@ async def text_handler(message: Message):
         await safe_status(f"Could not resolve that message: {exc}")
     except Exception as exc:
         print(f"Scan failed: {type(exc).__name__}: {exc}", flush=True)
-        await status.edit_text(f"❌ Scan failed: {type(exc).__name__}: {exc}", reply_markup=menu())
+        await safe_status(f"❌ Scan failed: {type(exc).__name__}: {exc}")
 
 @dp.callback_query(F.data.startswith("pick:"))
 async def pick(callback: CallbackQuery):
