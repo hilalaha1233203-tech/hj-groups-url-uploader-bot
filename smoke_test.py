@@ -35,12 +35,26 @@ for _ in range(100):
     assert format_eta(4) == "4s left"
     assert format_eta(60) == "1m 0s left"
 
-assert "mongo_ok = await session_store.ping()" in BOT
-assert "Command menu setup failed; continuing to polling" in BOT
-assert "bot will still start" in BOT
-assert "MongoDB unavailable; continuing with local fallback" in STORE
-assert "async def ping(self) -> bool" in STORE
-assert "class ProgressFileStream(httpx.AsyncByteStream)" in PLAYBOOK
-assert "Content-Length" in PLAYBOOK
+# Authorization/persistence assertions.
+assert "def access_role(uid):" in BOT
+assert "def is_owner(uid):" in BOT
+assert "if not is_owner(uid):" in BOT
+assert "role=\"vip\"" in BOT
+assert "VOROA_OWNER_USER_ID" in BOT
+assert "MongoDB connected" in STORE
+assert "local mirror" in STORE
+assert "/data/voroa_session_store.json" in STORE
+assert "if self._mongo_healthy:" in STORE
 
-print("Voroa smoke checks: PASS (100x parser/ETA regression + resilience assertions)")
+# Playbook signed-upload protocol assertions based on the current API contract.
+assert "assets/upload_prepare" in PLAYBOOK
+assert "assets/upload_complete" in PLAYBOOK
+assert "x-goog-resumable" in PLAYBOOK
+assert "Content-Range" in PLAYBOOK
+assert '"Content-Type": "text/plain"' in PLAYBOOK
+assert "multipart_upload_id" in PLAYBOOK
+assert "x-amz-meta-extension" in PLAYBOOK
+assert "x-amz-meta-encrypted-organization-metadata" in PLAYBOOK
+assert "class ProgressFileStream(httpx.AsyncByteStream)" in PLAYBOOK
+
+print("Voroa smoke checks: PASS (parser/ETA + authorization/persistence + Playbook signed-upload assertions)")
