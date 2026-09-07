@@ -64,18 +64,9 @@ class Job:
     selected: set[int]
 
 def menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🔐 Login"), KeyboardButton(text="📱 Session")],
-            [KeyboardButton(text="🔗 Scan Link"), KeyboardButton(text="📦 Bulk Range")],
-            [KeyboardButton(text="🎯 Destination"), KeyboardButton(text="📋 Select Files")],
-            [KeyboardButton(text="❌ Cancel"), KeyboardButton(text="🚪 Logout")],
-            [KeyboardButton(text="ℹ️ Help")],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="Choose a function or send a Telegram link",
-    )
+    # Functions are exposed through Telegram's command menu only.
+    # Never attach a ReplyKeyboard to messages.
+    return None
 
 def allowed(uid):
     return bool(uid and uid in ALLOWED_USER_IDS)
@@ -793,10 +784,20 @@ async def text_handler(message: Message):
     status = await message.answer("🔎 Starting bulk scan…" if bulk else "🔎 Starting scan…", reply_markup=menu())
 
     async def safe_status(text):
+        nonlocal status
         try:
-            await asyncio.wait_for(status.edit_text(text, reply_markup=menu()), timeout=8)
+            await asyncio.wait_for(status.edit_text(text, reply_markup=None), timeout=8)
+            print(f"[Voroa] SCAN STATUS: {text.replace(chr(10), ' | ')}", flush=True)
+            return
         except Exception as exc:
-            print(f"[Voroa] Status update failed: {type(exc).__name__}: {exc}", flush=True)
+            print(f"[Voroa] Status edit failed: {type(exc).__name__}: {exc}", flush=True)
+        # If Telegram refuses to edit the original message, create a fresh
+        # status message and continue using that message for all later updates.
+        try:
+            status = await message.answer(text)
+            print(f"[Voroa] SCAN STATUS FALLBACK: {text.replace(chr(10), ' | ')}", flush=True)
+        except Exception as exc:
+            print(f"[Voroa] Status fallback send failed: {type(exc).__name__}: {exc}", flush=True)
 
     async def bounded(coro, timeout=SCAN_TIMEOUT_SECONDS):
         task = asyncio.create_task(coro)
