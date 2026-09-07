@@ -1,0 +1,59 @@
+name: Current Voroa State Validation
+on:
+  push:
+    branches: [main]
+jobs:
+  validate:
+    if: "!contains(github.event.head_commit.message, '[skip state-validation]')"
+    runs-on: ubuntu-latest
+    env:
+      TELEGRAM_API_ID: '12345'
+      TELEGRAM_API_HASH: '0123456789abcdef0123456789abcdef'
+      TELEGRAM_BOT_TOKEN: '123456:TEST_TOKEN'
+      TELEGRAM_ALLOWED_USER_IDS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile all source
+        run: python -m py_compile start.py telegram_bot.py telegram_session_store.py playbook_client.py
+      - name: 100x functional regression
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          src = Path('telegram_bot.py').read_text(encoding='utf-8')
+          tree = ast.parse(src)
+          wanted = {'parse_link','parse_bulk_link','format_eta'}
+          nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
+          ns = {'re': __import__('re'), 'MAX_BULK_MESSAGES': 500}
+          exec(compile(ast.Module(body=nodes, type_ignores=[]), 'subset.py', 'exec'), ns)
+          for _ in range(100):
+              assert ns['parse_bulk_link']('https://t.me/c/4433695631/471-480') == ('-1004433695631', 471, 480)
+              assert ns['parse_bulk_link']('https://t.me/c/4433695631/471 480') == ('-1004433695631', 471, 480)
+              assert ns['parse_bulk_link']('https://t.me/c/4433695631/471') is None
+              assert ns['parse_link']('https://t.me/c/4433695631/471') == ('-1004433695631', 471)
+              assert ns['format_eta'](4) == '4s left'
+              assert ns['format_eta'](3) == '3s left'
+          print('100x functional regression passed.')
+          PY
+      - name: Current-state audit
+        run: |
+          grep -q 'DESTINATIONS = {}' telegram_bot.py
+          grep -q 'async def load_destination(uid)' telegram_bot.py
+          grep -q 'async def set_destination(uid, dest)' telegram_bot.py
+          grep -q 'def safe_filename(msg):' telegram_bot.py
+          grep -q 'def format_eta(seconds):' telegram_bot.py
+          grep -q 'progress_callback' telegram_bot.py
+          grep -q 'current >= total' telegram_bot.py
+          grep -q 'previous.cancel()' telegram_bot.py
+          grep -q 'Scan timed out after 35 seconds' telegram_bot.py
+          grep -q 'async def get_destination(self, user_id: int)' telegram_session_store.py
+          grep -q 'async def set_destination(self, user_id: int, destination: str)' telegram_session_store.py
+          grep -q 'class ProgressFileStream(httpx.AsyncByteStream):' playbook_client.py
+          grep -q 'content=ProgressFileStream(path, size, progress_callback)' playbook_client.py
+          git diff --check
+          echo 'Current-state audit passed.'
