@@ -34,6 +34,7 @@ BRANDING = os.getenv("TELEGRAM_BRANDING", "@hjgroups_1").strip()
 BOT_DELETE_SECONDS = max(0, int(os.getenv("TELEGRAM_BOT_DELETE_SECONDS", "3600")))
 MAX_BULK_MESSAGES = max(1, int(os.getenv("TELEGRAM_MAX_BULK_MESSAGES", "500")))
 MAX_ACTIVE_JOBS = max(1, int(os.getenv("TELEGRAM_MAX_ACTIVE_JOBS", "1")))
+SCAN_TIMEOUT_SECONDS = max(10, int(os.getenv("TELEGRAM_SCAN_TIMEOUT_SECONDS", "35")))
 STATE_FILE = Path(os.getenv("TELEGRAM_STATE_FILE", "telegram_media_state.json"))
 
 ENV_DESTINATIONS = {}
@@ -164,7 +165,38 @@ async def rebuild(session):
     if user_client.is_connected():
         await user_client.disconnect()
     user_client = TelegramClient(StringSession(session), API_ID, API_HASH)
-    await user_client.connect()
+    await asyncio.wait_for(user_client.connect(), timeout=SCAN_TIMEOUT_SECONDS)
+
+async def ensure_user_client():
+    session = await saved_session()
+    if not session:
+        raise RuntimeError("No saved Telegram session. Press 🔐 Login first.")
+    if not user_client.is_connected():
+        await rebuild(session)
+    authorized = await asyncio.wait_for(user_client.is_user_authorized(), timeout=SCAN_TIMEOUT_SECONDS)
+    if not authorized:
+        raise RuntimeError("Telegram session is no longer authorized. Press 🔐 Login first.")
+
+async def resolve_message_peer(peer):
+    # For t.me/c/<internal-id>/<message-id>, Telegram gives only the marked chat ID.
+    # Telethon can resolve a negative -100... ID from its entity cache. If the entity
+    # is not cached, walk dialogs until the matching channel/chat is found.
+    try:
+        return await asyncio.wait_for(user_client.get_input_entity(peer), timeout=SCAN_TIMEOUT_SECONDS)
+    except (ValueError, TypeError):
+        target_id = int(peer) if str(peer).lstrip("-").isdigit() else None
+        if target_id is None:
+            return await asyncio.wait_for(user_client.get_entity(peer), timeout=SCAN_TIMEOUT_SECONDS)
+        async def find_in_dialogs():
+            async for dialog in user_client.iter_dialogs():
+                entity = getattr(dialog, "entity", None)
+                if entity is not None and getattr(entity, "id", None) == abs(target_id) and getattr(dialog, "id", None) == target_id:
+                    return entity
+            return None
+        entity = await asyncio.wait_for(find_in_dialogs(), timeout=SCAN_TIMEOUT_SECONDS)
+        if entity is None:
+            raise ValueError(f"Telegram channel/chat {peer} is not in the logged-in account's dialogs. Make sure the account has access to that channel.")
+        return entity
 
 def scan_menu(uid):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -522,12 +554,18 @@ async def range_cmd(message: Message):
         count = end_id - start_id + 1
         if count > MAX_BULK_MESSAGES:
             raise ValueError(f"Maximum range is {MAX_BULK_MESSAGES} messages.")
-        source = await user_client.get_entity(parts[1])
+        await ensure_user_client()
+        source = await asyncio.wait_for(user_client.get_entity(parts[1]), timeout=SCAN_TIMEOUT_SECONDS)
         status = await message.answer("🔎 Scanning messages...", reply_markup=menu())
-        msgs = await user_client.get_messages(source, ids=list(range(start_id, end_id + 1)))
+        msgs = await asyncio.wait_for(user_client.get_messages(source, ids=list(range(start_id, end_id + 1))), timeout=SCAN_TIMEOUT_SECONDS)
         await create_job(uid, source, [msg for msg in msgs if msg and getattr(msg, "media", None)], status)
+    except asyncio.TimeoutError:
+        await message.answer("⏱️ Telegram did not respond within the scan timeout. Please try the range again.", reply_markup=menu())
     except (ValueError, RPCError) as exc:
         await message.answer(f"Could not scan range: {exc}", reply_markup=menu())
+    except Exception as exc:
+        print(f"Range scan failed: {type(exc).__name__}: {exc}", flush=True)
+        await message.answer(f"❌ Range scan failed: {type(exc).__name__}: {exc}", reply_markup=menu())
 
 @dp.message(Command("select"))
 async def select_cmd(message: Message):
@@ -625,14 +663,22 @@ async def text_handler(message: Message):
         return await message.answer("Set a destination first with 🎯 Destination.", reply_markup=menu())
     status = await message.answer("🔎 Scanning message...", reply_markup=menu())
     try:
+        await ensure_user_client()
         peer, mid = parse_link(text)
-        source = await user_client.get_entity(peer)
-        msg = await user_client.get_messages(source, ids=mid)
+        await status.edit_text("🔎 Resolving Telegram channel...", reply_markup=menu())
+        source = await resolve_message_peer(peer)
+        await status.edit_text("🔎 Fetching message...", reply_markup=menu())
+        msg = await asyncio.wait_for(user_client.get_messages(source, ids=mid), timeout=SCAN_TIMEOUT_SECONDS)
         if not msg or not getattr(msg, "media", None):
             return await status.edit_text("That message does not contain downloadable media.", reply_markup=menu())
         await create_job(uid, source, [msg], status)
+    except asyncio.TimeoutError:
+        await status.edit_text("⏱️ Telegram did not respond within the scan timeout. Check that the logged-in account can open this channel, then try again.", reply_markup=menu())
     except (ValueError, RPCError) as exc:
         await status.edit_text(f"Could not resolve that message: {exc}", reply_markup=menu())
+    except Exception as exc:
+        print(f"Scan failed: {type(exc).__name__}: {exc}", flush=True)
+        await status.edit_text(f"❌ Scan failed: {type(exc).__name__}: {exc}", reply_markup=menu())
 
 @dp.callback_query(F.data.startswith("pick:"))
 async def pick(callback: CallbackQuery):
