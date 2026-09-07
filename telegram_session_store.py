@@ -87,23 +87,46 @@ class SessionStore:
         }
         self._save_local()
 
+    @staticmethod
+    def _timestamp(value: Any) -> Optional[datetime]:
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            result = value
+        elif isinstance(value, str):
+            try:
+                result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        else:
+            return None
+        return result if result.tzinfo else result.replace(tzinfo=timezone.utc)
+
     async def _sync_local_to_mongo(self) -> None:
-        """Replay locally mirrored writes/deletes after MongoDB recovery."""
+        """Replay local writes/deletes after MongoDB recovery without losing newer state."""
         if not self._mongo_healthy or self._collection is None or not self._local:
             return
         for key, payload in list(self._local.items()):
             if not isinstance(payload, dict):
                 continue
             try:
+                remote = await self._collection.find_one({"_id": key})
+                local_ts = self._timestamp(payload.get("updated_at")) or datetime.min.replace(tzinfo=timezone.utc)
+                remote_ts = self._timestamp((remote or {}).get("updated_at")) if isinstance(remote, dict) else None
                 if payload.get("_deleted"):
-                    await self._collection.delete_one({"_id": key})
+                    if remote is not None and (remote_ts is None or local_ts >= remote_ts):
+                        await self._collection.delete_one({"_id": key})
+                    self._local.pop(key, None)
+                elif remote is None:
+                    await self._collection.insert_one(dict(payload, _id=key))
+                    self._local.pop(key, None)
+                elif remote_ts is None or local_ts > remote_ts:
+                    replacement = dict(payload)
+                    replacement.pop("_id", None)
+                    await self._collection.update_one({"_id": key}, {"$set": replacement})
                     self._local.pop(key, None)
                 else:
-                    await self._collection.update_one(
-                        {"_id": key},
-                        {"$setOnInsert": payload},
-                        upsert=True,
-                    )
+                    self._local.pop(key, None)
             except (PyMongoError, OSError, TimeoutError) as exc:
                 self._last_error = exc
                 self._mongo_healthy = False
