@@ -1,4 +1,4 @@
-"""HJ GROUPS Telegram Media Collector with Telegram command menu."""
+"""HJ GROUPS Telegram Media Collector with persistent button UI."""
 from __future__ import annotations
 import asyncio, json, os, re, tempfile
 from dataclasses import dataclass
@@ -6,7 +6,16 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, BotCommand, MenuButtonCommands
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    BotCommand,
+    MenuButtonCommands,
+)
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError
@@ -50,9 +59,18 @@ class Job:
     selected: set[int]
 
 def menu():
-    # We intentionally do not use a ReplyKeyboardMarkup. Telegram's command/menu
-    # button is configured at startup, matching the BotFather-style command list.
-    return None
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔐 Login"), KeyboardButton(text="📱 Session")],
+            [KeyboardButton(text="🔗 Scan Link"), KeyboardButton(text="📦 Bulk Range")],
+            [KeyboardButton(text="🎯 Destination"), KeyboardButton(text="📋 Select Files")],
+            [KeyboardButton(text="❌ Cancel"), KeyboardButton(text="🚪 Logout")],
+            [KeyboardButton(text="ℹ️ Help")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Choose a function or send a Telegram link",
+    )
 
 def allowed(uid):
     return bool(uid and uid in ALLOWED_USER_IDS)
@@ -176,7 +194,7 @@ async def create_job(uid, source, messages, status):
         return await status.edit_text("No downloadable media messages were found.", reply_markup=menu())
     dest = destination(uid)
     if not dest:
-        return await status.edit_text("Set a destination first with /setdestination.", reply_markup=menu())
+        return await status.edit_text("Set a destination first with /setdestination or 🎯 Destination.", reply_markup=menu())
     candidates = {msg.id: msg for msg in messages}
     JOBS[uid] = Job(uid, source, candidates, dest, set(candidates) if len(candidates) == 1 else set())
     await status.edit_text(
@@ -253,7 +271,8 @@ async def start(message: Message):
         await message.answer("⛔ You are not authorized to use this bot.")
         return
     await message.answer(
-        "HJ GROUPS Media Collector\n\nUse the Telegram menu button to choose a function.\n\nCommands:\n/start — main menu\n/login — login Telegram account\n/otp — submit OTP\n/2fa — submit 2FA password\n/session — check session\n/setdestination — set delivery destination\n/range — bulk message range\n/select — select scanned files\n/cancel — cancel current job\n/logout — logout Telegram account\n/help — show help"
+        "HJ GROUPS Media Collector\n\nChoose a function from the buttons below or send a Telegram message link directly.",
+        reply_markup=menu(),
     )
 
 @dp.message(Command("help"))
@@ -263,7 +282,8 @@ async def help_cmd(message: Message):
         await message.answer("⛔ You are not authorized to use this bot.")
         return
     await message.answer(
-        "HJ GROUPS Media Collector\n\n🔗 Send a Telegram message link to scan one media file.\n📦 /range @channel START_ID END_ID scans multiple messages.\n📋 /select ID,ID,ID selects files from the current scan.\n🎯 /setdestination @username_or_chat_id sets the delivery target.\n🔐 /login starts Telegram user login.\n📱 /session checks the saved session.\n🚪 /logout removes the saved Telegram session.\n❌ /cancel cancels the current job."
+        "HJ GROUPS Media Collector\n\n🔗 Scan Link — send a Telegram message link.\n📦 Bulk Range — send: @channel START_ID END_ID.\n📋 Select Files — use after a scan, then send: 25,31,44.\n🎯 Destination — send @username or chat ID.\n🔐 Login — send your Telegram phone number.\n📱 Session — check the saved session.\n🚪 Logout — remove the saved Telegram session.\n❌ Cancel — cancel the current job or pending input.",
+        reply_markup=menu(),
     )
 
 @dp.message(Command("login"))
@@ -274,9 +294,10 @@ async def login_cmd(message: Message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2:
-        return await message.answer("Usage: /login +91xxxxxxxxxx")
+        PENDING[uid] = "phone"
+        return await message.answer("🔐 Send your Telegram phone number, for example +91xxxxxxxxxx.", reply_markup=menu())
     if not session_store.configured and not SESSION_STRING:
-        return await message.answer("Session storage is not configured.")
+        return await message.answer("Session storage is not configured.", reply_markup=menu())
     phone = parts[1].strip()
     async with LOGIN_LOCK:
         try:
@@ -284,10 +305,11 @@ async def login_cmd(message: Message):
             sent = await user_client.send_code_request(phone)
             await session_store.set_login(uid, phone, sent.phone_code_hash, user_client.session.save())
             PENDING[uid] = "otp"
-            await message.answer("OTP sent. Now use /otp 12345 or type only the OTP number.")
+            await message.answer("OTP sent. Enter the OTP number here or use /otp 12345.", reply_markup=menu())
         except Exception as exc:
             await session_store.clear_login(uid)
-            await message.answer(f"Login failed: {type(exc).__name__}: {exc}")
+            PENDING.pop(uid, None)
+            await message.answer(f"Login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
 
 @dp.message(Command("otp"))
 async def otp_cmd(message: Message):
@@ -297,22 +319,23 @@ async def otp_cmd(message: Message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2:
-        return await message.answer("Usage: /otp 12345")
+        PENDING[uid] = "otp"
+        return await message.answer("Enter the OTP number, for example 12345.", reply_markup=menu())
     pending = await session_store.get_login(uid)
     if not pending or not pending.get("phone") or not pending.get("phone_code_hash") or not pending.get("session_string"):
-        return await message.answer("No login is waiting. Use /login first.")
+        return await message.answer("No login is waiting. Use 🔐 Login first.", reply_markup=menu())
     try:
         await rebuild(pending["session_string"])
         await user_client.sign_in(pending["phone"], parts[1].strip(), phone_code_hash=pending["phone_code_hash"])
         await session_store.set(user_client.session.save())
         await session_store.clear_login(uid)
         PENDING.pop(uid, None)
-        await message.answer("Telegram account login successful. ✅")
+        await message.answer("Telegram account login successful. ✅", reply_markup=menu())
     except SessionPasswordNeededError:
         PENDING[uid] = "2fa"
-        await message.answer("2FA enabled. Now use /2fa your_password or type only the password.")
+        await message.answer("2FA enabled. Enter the Telegram 2FA password.", reply_markup=menu())
     except Exception as exc:
-        await message.answer(f"OTP login failed: {type(exc).__name__}: {exc}")
+        await message.answer(f"OTP login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
 
 @dp.message(Command("2fa"))
 async def twofa_cmd(message: Message):
@@ -322,19 +345,20 @@ async def twofa_cmd(message: Message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2:
-        return await message.answer("Usage: /2fa your_password")
+        PENDING[uid] = "2fa"
+        return await message.answer("Enter your Telegram 2FA password.", reply_markup=menu())
     pending = await session_store.get_login(uid)
     if not pending or not pending.get("session_string"):
-        return await message.answer("No 2FA login is waiting. Use /login first.")
+        return await message.answer("No 2FA login is waiting. Use 🔐 Login first.", reply_markup=menu())
     try:
         await rebuild(pending["session_string"])
         await user_client.sign_in(password=parts[1])
         await session_store.set(user_client.session.save())
         await session_store.clear_login(uid)
         PENDING.pop(uid, None)
-        await message.answer("Telegram account login successful. ✅")
+        await message.answer("Telegram account login successful. ✅", reply_markup=menu())
     except Exception as exc:
-        await message.answer(f"2FA login failed: {type(exc).__name__}: {exc}")
+        await message.answer(f"2FA login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
 
 @dp.message(Command("logout"))
 async def logout_cmd(message: Message):
@@ -349,7 +373,7 @@ async def logout_cmd(message: Message):
         await session_store.clear()
         await session_store.clear_login(uid)
     PENDING.pop(uid, None)
-    await message.answer("Telegram account logged out and saved session removed. ✅")
+    await message.answer("Telegram account logged out and saved session removed. ✅", reply_markup=menu())
 
 @dp.message(Command("session"))
 async def session_cmd(message: Message):
@@ -359,17 +383,17 @@ async def session_cmd(message: Message):
         return
     session = await saved_session()
     if not session:
-        return await message.answer("No Telegram user session. Use /login.")
+        return await message.answer("No Telegram user session. Use 🔐 Login.", reply_markup=menu())
     try:
         if not user_client.is_connected():
             await rebuild(session)
         if await user_client.is_user_authorized():
             me = await user_client.get_me()
-            await message.answer(f"Session active: {getattr(me, 'username', None) or me.id} ✅")
+            await message.answer(f"Session active: {getattr(me, 'username', None) or me.id} ✅", reply_markup=menu())
         else:
-            await message.answer("Session is not authorized. Use /login.")
+            await message.answer("Session is not authorized. Use 🔐 Login.", reply_markup=menu())
     except Exception as exc:
-        await message.answer(f"Session check failed: {type(exc).__name__}: {exc}")
+        await message.answer(f"Session check failed: {type(exc).__name__}: {exc}", reply_markup=menu())
 
 @dp.message(Command("setdestination"))
 async def setdest_cmd(message: Message):
@@ -379,10 +403,11 @@ async def setdest_cmd(message: Message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2:
-        return await message.answer("Usage: /setdestination @channel_or_chat_id")
+        PENDING[uid] = "destination"
+        return await message.answer("🎯 Send the destination username or chat ID, for example @mychannel or -1001234567890.", reply_markup=menu())
     set_destination(uid, parts[1])
     PENDING.pop(uid, None)
-    await message.answer(f"✅ Destination saved: {parts[1]}")
+    await message.answer(f"✅ Destination saved: {parts[1]}", reply_markup=menu())
 
 @dp.message(Command("cancel"))
 async def cancel_cmd(message: Message):
@@ -393,7 +418,7 @@ async def cancel_cmd(message: Message):
     JOBS.pop(uid, None)
     PENDING.pop(uid, None)
     await session_store.clear_login(uid)
-    await message.answer("❌ Current job cancelled.")
+    await message.answer("❌ Current job cancelled.", reply_markup=menu())
 
 @dp.message(Command("range"))
 async def range_cmd(message: Message):
@@ -403,9 +428,10 @@ async def range_cmd(message: Message):
         return
     parts = (message.text or "").split()
     if len(parts) != 4:
-        return await message.answer("Usage: /range @channel START_ID END_ID")
+        PENDING[uid] = "range"
+        return await message.answer("📦 Send the range as: @channel START_ID END_ID", reply_markup=menu())
     if not destination(uid):
-        return await message.answer("Set a destination first with /setdestination.")
+        return await message.answer("Set a destination first with 🎯 Destination.", reply_markup=menu())
     try:
         start_id, end_id = int(parts[2]), int(parts[3])
         if start_id <= 0 or end_id < start_id:
@@ -414,11 +440,11 @@ async def range_cmd(message: Message):
         if count > MAX_BULK_MESSAGES:
             raise ValueError(f"Maximum range is {MAX_BULK_MESSAGES} messages.")
         source = await user_client.get_entity(parts[1])
-        status = await message.answer("🔎 Scanning messages...")
+        status = await message.answer("🔎 Scanning messages...", reply_markup=menu())
         msgs = await user_client.get_messages(source, ids=list(range(start_id, end_id + 1)))
         await create_job(uid, source, [msg for msg in msgs if msg and getattr(msg, "media", None)], status)
     except (ValueError, RPCError) as exc:
-        await message.answer(f"Could not scan range: {exc}")
+        await message.answer(f"Could not scan range: {exc}", reply_markup=menu())
 
 @dp.message(Command("select"))
 async def select_cmd(message: Message):
@@ -429,21 +455,63 @@ async def select_cmd(message: Message):
     job = JOBS.get(uid)
     parts = (message.text or "").split(maxsplit=1)
     if not job:
-        return await message.answer("No active scan. Send a Telegram message link or use /range first.")
+        return await message.answer("No active scan. Use 🔗 Scan Link or 📦 Bulk Range first.", reply_markup=menu())
     if len(parts) != 2:
-        return await message.answer("Usage: /select 25,31,44")
+        PENDING[uid] = "select"
+        return await message.answer("📋 Send the file message IDs as: 25,31,44", reply_markup=menu())
     try:
         ids = {int(value.strip()) for value in parts[1].split(",") if value.strip()}
     except ValueError:
-        return await message.answer("Message IDs must be comma-separated numbers.")
+        return await message.answer("Message IDs must be comma-separated numbers.", reply_markup=menu())
     missing = ids - set(job.candidates)
     if missing:
-        return await message.answer("IDs not in current scan: " + ", ".join(map(str, sorted(missing)[:20])))
+        return await message.answer("IDs not in current scan: " + ", ".join(map(str, sorted(missing)[:20])), reply_markup=menu())
     job.selected = ids
+    PENDING.pop(uid, None)
     await message.answer(
         f"Selected {len(ids)} file(s).\nTotal size: {size(sum(media_size(job.candidates[i]) for i in ids))}\n\nDestination: {job.destination}\n\nConfirm?",
         reply_markup=confirm_menu(uid),
     )
+
+@dp.message(F.text == "🔐 Login")
+async def button_login(message: Message):
+    return await login_cmd(message.model_copy(update={"text": "/login"}))
+
+@dp.message(F.text == "📱 Session")
+async def button_session(message: Message):
+    return await session_cmd(message.model_copy(update={"text": "/session"}))
+
+@dp.message(F.text == "🔗 Scan Link")
+async def button_scan(message: Message):
+    uid = message.from_user.id if message.from_user else None
+    if not allowed(uid):
+        return
+    PENDING[uid] = "scan"
+    await message.answer("🔗 Send the Telegram message link (t.me/.../message_id).", reply_markup=menu())
+
+@dp.message(F.text == "📦 Bulk Range")
+async def button_range(message: Message):
+    return await range_cmd(message.model_copy(update={"text": "/range"}))
+
+@dp.message(F.text == "🎯 Destination")
+async def button_destination(message: Message):
+    return await setdest_cmd(message.model_copy(update={"text": "/setdestination"}))
+
+@dp.message(F.text == "📋 Select Files")
+async def button_select(message: Message):
+    return await select_cmd(message.model_copy(update={"text": "/select"}))
+
+@dp.message(F.text == "❌ Cancel")
+async def button_cancel(message: Message):
+    return await cancel_cmd(message.model_copy(update={"text": "/cancel"}))
+
+@dp.message(F.text == "🚪 Logout")
+async def button_logout(message: Message):
+    return await logout_cmd(message.model_copy(update={"text": "/logout"}))
+
+@dp.message(F.text == "ℹ️ Help")
+async def button_help(message: Message):
+    return await help_cmd(message.model_copy(update={"text": "/help"}))
 
 @dp.message(F.text)
 async def text_handler(message: Message):
@@ -452,24 +520,36 @@ async def text_handler(message: Message):
         return
     text = (message.text or "").strip()
     action = PENDING.get(uid)
+    if action == "phone":
+        return await login_cmd(message.model_copy(update={"text": f"/login {text}"}))
     if action == "otp":
         return await otp_cmd(message.model_copy(update={"text": f"/otp {text}"}))
     if action == "2fa":
         return await twofa_cmd(message.model_copy(update={"text": f"/2fa {text}"}))
+    if action == "destination":
+        return await setdest_cmd(message.model_copy(update={"text": f"/setdestination {text}"}))
+    if action == "range":
+        return await range_cmd(message.model_copy(update={"text": f"/range {text}"}))
+    if action == "select":
+        return await select_cmd(message.model_copy(update={"text": f"/select {text}"}))
+    if action == "scan":
+        PENDING.pop(uid, None)
+        if not re.match(r"^https?://(?:www\.)?t\.me/", text):
+            return await message.answer("Send a valid Telegram t.me message link.", reply_markup=menu())
     if not re.match(r"^https?://(?:www\.)?t\.me/", text):
-        return await message.answer("Send a Telegram t.me message link or use the command menu.")
+        return await message.answer("Send a Telegram t.me message link or use the buttons below.", reply_markup=menu())
     if not destination(uid):
-        return await message.answer("Set a destination first with /setdestination.")
-    status = await message.answer("🔎 Scanning message...")
+        return await message.answer("Set a destination first with 🎯 Destination.", reply_markup=menu())
+    status = await message.answer("🔎 Scanning message...", reply_markup=menu())
     try:
         peer, mid = parse_link(text)
         source = await user_client.get_entity(peer)
         msg = await user_client.get_messages(source, ids=mid)
         if not msg or not getattr(msg, "media", None):
-            return await status.edit_text("That message does not contain downloadable media.")
+            return await status.edit_text("That message does not contain downloadable media.", reply_markup=menu())
         await create_job(uid, source, [msg], status)
     except (ValueError, RPCError) as exc:
-        await status.edit_text(f"Could not resolve that message: {exc}")
+        await status.edit_text(f"Could not resolve that message: {exc}", reply_markup=menu())
 
 @dp.callback_query(F.data.startswith("pick:"))
 async def pick(callback: CallbackQuery):
@@ -538,7 +618,7 @@ async def cancel_callback(callback: CallbackQuery):
         JOBS.pop(uid, None)
         PENDING.pop(uid, None)
         await session_store.clear_login(uid)
-    await callback.message.edit_text("❌ Cancelled.")
+    await callback.message.edit_text("❌ Cancelled.", reply_markup=menu())
     await callback.answer()
 
 async def configure_command_menu():
@@ -565,17 +645,31 @@ async def main():
     if not ALLOWED_USER_IDS:
         raise RuntimeError("Set TELEGRAM_ALLOWED_USER_IDS to at least one Telegram user ID.")
     await configure_command_menu()
-    session = await saved_session()
-    if session:
-        await rebuild(session)
-        if await user_client.is_user_authorized():
-            me = await user_client.get_me()
-            print(f"Telethon connected as {getattr(me, 'username', None) or me.id}")
+    try:
+        session = await saved_session()
+        if session:
+            await rebuild(session)
+            if await user_client.is_user_authorized():
+                me = await user_client.get_me()
+                print(f"Telethon connected as {getattr(me, 'username', None) or me.id}", flush=True)
+            else:
+                print("Saved Telegram session is not authorized; use /login", flush=True)
         else:
-            print("Saved Telegram session is not authorized; use /login")
-    else:
-        print("Telethon user session not configured; use /login")
-    await dp.start_polling(bot)
+            print("Telethon user session not configured; use /login", flush=True)
+        await dp.start_polling(bot)
+    finally:
+        for task in list(DELETE_TASKS):
+            task.cancel()
+        if DELETE_TASKS:
+            await asyncio.gather(*DELETE_TASKS, return_exceptions=True)
+        try:
+            if user_client.is_connected():
+                await user_client.disconnect()
+        finally:
+            try:
+                await session_store.close()
+            finally:
+                await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
