@@ -41,7 +41,6 @@ assert "bot will still start" in BOT
 assert "MongoDB unavailable; continuing with local fallback" in STORE
 assert "async def ping(self) -> bool" in STORE
 assert "class ProgressFileStream(httpx.AsyncByteStream)" in PLAYBOOK
-assert "Content-Length":  # source-level sanity marker intentionally checked separately
-    True
+assert "Content-Length" in PLAYBOOK
 
 print("Voroa smoke checks: PASS (100x parser/ETA regression + resilience assertions)")
