@@ -122,6 +122,12 @@ async def load_access_state():
             OWNER_USER_ID = row_id
     if not OWNER_USER_ID:
         raise RuntimeError("No Voroa owner is configured. Set VOROA_OWNER_USER_ID or TELEGRAM_ALLOWED_USER_IDS.")
+    if EXPLICIT_OWNER_ID:
+        for row in rows:
+            row_id = int(row["user_id"])
+            if row_id != OWNER_USER_ID and str(row.get("role", "")).lower() == "owner":
+                await session_store.set_access(row_id, active=False, expires_at=None, role="user")
+                ACCESS_CACHE[row_id] = {"user_id": row_id, "active": False, "expires_at": None, "role": "user"}
     await session_store.set_access(OWNER_USER_ID, active=True, expires_at=None, role="owner")
     ACCESS_CACHE[OWNER_USER_ID] = {"user_id": OWNER_USER_ID, "active": True, "expires_at": None, "role": "owner"}
     for uid in ALLOWED_USER_IDS:
@@ -130,7 +136,7 @@ async def load_access_state():
         existing = ACCESS_CACHE.get(uid)
         if not existing:
             await session_store.set_access(uid, active=True, expires_at=None, role="user")
-            ACCESS_CACHE[uid] = {"user_id": uid, "active": True, "expires_at": None, "role":"user"}
+            ACCESS_CACHE[uid] = {"user_id": uid, "active": True, "expires_at": None, "role": "user"}
 
 def load_state():
     try:
