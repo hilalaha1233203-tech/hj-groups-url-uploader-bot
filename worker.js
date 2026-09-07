@@ -1,7 +1,9 @@
 const { spawn } = require("node:child_process");
 
 const python = process.env.PYTHON_BIN || "python3";
-const args = ["telegram_chat_exporter.py"];
+// start.py normalizes Voroa's API_ID/API_HASH/BOT_TOKEN names to the
+// TELEGRAM_* names expected by the Python application.
+const args = ["start.py"];
 
 console.log(`[Voroa] Starting Telegram worker with ${python} ${args.join(" ")}`);
 
