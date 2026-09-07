@@ -104,6 +104,33 @@ class SessionStore:
         data.pop(key, None)
         self._fallback_write(data)
 
+    async def get_destination(self, user_id: int) -> Optional[str]:
+        key = f"destination:{int(user_id)}"
+        document, ok = await self._mongo(lambda c: c.find_one({"_id": key}))
+        if not ok:
+            document = self._fallback_read().get(key)
+        if not document or not isinstance(document, dict):
+            return None
+        value = str(document.get("destination", "")).strip()
+        return value or None
+
+    async def set_destination(self, user_id: int, destination: str) -> None:
+        key = f"destination:{int(user_id)}"
+        value = destination.strip()
+        payload = {"destination": value}
+        _, ok = await self._mongo(lambda c: c.update_one({"_id": key}, {"$set": payload}, upsert=True))
+        if not ok:
+            data = self._fallback_read()
+            data[key] = payload
+            self._fallback_write(data)
+
+    async def clear_destination(self, user_id: int) -> None:
+        key = f"destination:{int(user_id)}"
+        await self._mongo(lambda c: c.delete_one({"_id": key}))
+        data = self._fallback_read()
+        data.pop(key, None)
+        self._fallback_write(data)
+
     async def close(self) -> None:
         if self._client is not None:
             self._client.close()

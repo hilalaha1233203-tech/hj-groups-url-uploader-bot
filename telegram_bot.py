@@ -1,6 +1,6 @@
 """HJ GROUPS Telegram Media Collector with persistent button UI."""
 from __future__ import annotations
-import asyncio, json, os, re, tempfile
+import asyncio, json, os, re, tempfile, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -53,6 +53,7 @@ LOGIN_LOCK = asyncio.Lock()
 PENDING = {}
 JOBS = {}
 QR_CLIENTS = {}
+DESTINATIONS = {}
 
 @dataclass
 class Job:
@@ -95,11 +96,32 @@ def save_state():
         pass
 
 def destination(uid):
-    return (STATE.get(str(uid)) or ENV_DESTINATIONS.get(str(uid)) or DEFAULT_DESTINATION).strip()
+    return (DESTINATIONS.get(str(uid)) or STATE.get(str(uid)) or ENV_DESTINATIONS.get(str(uid)) or DEFAULT_DESTINATION).strip()
 
-def set_destination(uid, dest):
-    STATE[str(uid)] = dest.strip()
+async def load_destination(uid):
+    cached = DESTINATIONS.get(str(uid))
+    if cached:
+        return cached
+    try:
+        saved = await session_store.get_destination(uid)
+    except Exception as exc:
+        print(f"[Voroa] Destination load failed: {type(exc).__name__}: {exc}", flush=True)
+        saved = None
+    value = (saved or STATE.get(str(uid)) or ENV_DESTINATIONS.get(str(uid)) or DEFAULT_DESTINATION).strip()
+    if value:
+        DESTINATIONS[str(uid)] = value
+    return value
+
+async def set_destination(uid, dest):
+    value = dest.strip()
+    DESTINATIONS[str(uid)] = value
+    STATE[str(uid)] = value
     save_state()
+    try:
+        await session_store.set_destination(uid, value)
+    except Exception as exc:
+        print(f"[Voroa] Destination persistence failed: {type(exc).__name__}: {exc}", flush=True)
+    return value
 
 def size(n):
     if not n:
@@ -216,6 +238,44 @@ async def resolve_message_peer(peer):
             raise ValueError(f"Telegram channel/chat {peer} is not in the logged-in account's dialogs. Make sure the account has access to that channel.")
         return entity
 
+def safe_filename(msg):
+    name = getattr(getattr(msg, "file", None), "name", None)
+    if name:
+        return str(name)
+    return f"telegram-{getattr(msg, 'id', 'media')}"
+
+def format_eta(seconds):
+    if seconds is None or seconds < 0:
+        return "calculating…"
+    seconds = int(round(seconds))
+    if seconds < 1:
+        return "0s left"
+    if seconds < 60:
+        return f"{seconds}s left"
+    minutes, secs = divmod(seconds, 60)
+    return f"{minutes}m {secs}s left"
+
+def make_progress_callback(status, filename, stage, started_at):
+    state = {"last": 0.0}
+    def callback(current, total):
+        now = time.monotonic()
+        if total and current < total and now - state["last"] < 0.8:
+            return
+        state["last"] = now
+        if total:
+            percent = max(0.0, min(100.0, (current / total) * 100.0))
+            elapsed = max(0.1, now - started_at)
+            rate = current / elapsed if current > 0 else 0.0
+            eta = ((total - current) / rate) if rate > 0 else None
+            text = (f"📄 {filename}\n\n"
+                    f"{stage}\n"
+                    f"[{int(percent):3d}%] {'█' * int(percent // 10)}{'░' * (10 - int(percent // 10))}\n"
+                    f"⏳ {format_eta(eta)}")
+        else:
+            text = f"📄 {filename}\n\n{stage}\n⏳ calculating…"
+        asyncio.create_task(status.edit_text(text, reply_markup=menu()))
+    return callback
+
 def scan_menu(uid):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎵 Audio", callback_data=f"pick:{uid}:audio"), InlineKeyboardButton(text="🎬 Video", callback_data=f"pick:{uid}:video")],
@@ -255,33 +315,70 @@ async def create_job(uid, source, messages, status):
         reply_markup=scan_menu(uid),
     )
 
-async def send_destination(msg, dest):
+async def send_destination(msg, dest, status=None, index=1, total_files=1):
     token = os.getenv("PLAYBOOK_API_TOKEN", "").strip()
     org = os.getenv("PLAYBOOK_ORG_SLUG", "").strip()
+    filename = safe_filename(msg)
+    started_at = time.monotonic()
+
+    async def update(text):
+        if status is not None:
+            try:
+                await status.edit_text(text, reply_markup=menu())
+            except Exception:
+                pass
+
+    if status is not None:
+        await update(f"📄 {filename}\n\n🚀 Starting file {index}/{total_files}\n⏳ calculating…")
+
     if not token or not org:
-        return await flood(lambda: user_client.send_file(dest, msg.media, caption=caption(msg)))
+        callback = make_progress_callback(status, filename, "📤 Sending to destination…", started_at) if status is not None else None
+        kwargs = {"caption": caption(msg)}
+        if callback:
+            kwargs["progress_callback"] = callback
+        sent = await flood(lambda: user_client.send_file(dest, msg.media, **kwargs))
+        if status is not None:
+            await update(f"✅ {filename}\n\n📤 Sent successfully\n⏱️ {int(time.monotonic() - started_at)}s")
+        return sent
+
     temp_dir = Path(os.getenv("TELEGRAM_TEMP_DIR", tempfile.gettempdir()))
     temp_dir.mkdir(parents=True, exist_ok=True)
-    name = getattr(getattr(msg, "file", None), "name", None) or f"telegram-{getattr(msg, 'id', 'media')}"
-    path = temp_dir / name
+    path = temp_dir / filename
     try:
-        await user_client.download_media(msg, file=str(path))
+        download_cb = make_progress_callback(status, filename, "📥 Downloading from Telegram…", started_at) if status is not None else None
+        download_kwargs = {"file": str(path)}
+        if download_cb:
+            download_kwargs["progress_callback"] = download_cb
+        await user_client.download_media(msg, **download_kwargs)
+
         client = PlaybookClient(token=token, org_slug=org)
-        asset_token = await client.upload_file(path, title=name)
+        upload_started = time.monotonic()
+        await update(f"📄 {filename}\n\n☁️ Uploading to temporary storage…\n⏳ calculating…")
+        asset_token = await client.upload_file(
+            path,
+            title=filename,
+            progress_callback=(make_progress_callback(status, filename, "☁️ Uploading to temporary storage…", upload_started) if status is not None else None),
+        )
         asset = {}
-        for _ in range(30):
+        for poll in range(30):
             asset = await client.get_asset(asset_token)
             if not asset.get("is_skeleton", False):
                 break
+            if status is not None:
+                elapsed = int(time.monotonic() - upload_started)
+                await update(f"📄 {filename}\n\n☁️ Processing upload…\n⏳ {max(1, 60 - elapsed)}s left (estimate)")
             await asyncio.sleep(2)
         url = str(asset.get("display_url") or "").strip()
         if not url:
             raise PlaybookError(str(asset.get("source_error") or "Playbook asset has no display_url"))
-        sent = await flood(lambda: user_client.send_file(dest, url, name=name, caption=caption(msg)))
+        await update(f"📄 {filename}\n\n📤 Sending to destination…\n⏳ finalizing…")
+        sent = await flood(lambda: user_client.send_file(dest, url, name=filename, caption=caption(msg)))
         try:
             await client.delete_asset(asset_token)
         except Exception:
             pass
+        if status is not None:
+            await update(f"✅ {filename}\n\n📤 Sent successfully\n⏱️ {int(time.monotonic() - started_at)}s")
         return sent
     finally:
         try:
@@ -306,16 +403,21 @@ async def process(job, status):
     async with SEM:
         selected = [job.candidates[mid] for mid in job.candidates if mid in job.selected]
         done = failed = 0
-        for msg in selected:
+        total_files = len(selected)
+        for index, msg in enumerate(selected, 1):
+            filename = safe_filename(msg)
             try:
-                await send_destination(msg, job.destination)
+                await status.edit_text(f"📄 {filename}\n\n🚀 Starting {index}/{total_files}\n⏳ calculating…", reply_markup=menu())
+                await send_destination(msg, job.destination, status=status, index=index, total_files=total_files)
                 await send_copy(msg, job.owner_id)
                 done += 1
             except Exception as exc:
                 failed += 1
-                print(f"File {getattr(msg, 'id', '?')} failed: {type(exc).__name__}: {exc}")
-            await status.edit_text(f"⏳ Processing {done + failed}/{len(selected)} files...\n✅ Sent: {done}\n⚠️ Failed: {failed}")
-        await status.edit_text(f"✅ Completed\n\nSent: {done}\nFailed: {failed}\n\nDestination: {job.destination}", reply_markup=menu())
+                print(f"File {getattr(msg, 'id', '?')} failed: {type(exc).__name__}: {exc}", flush=True)
+                await status.edit_text(f"❌ {filename}\n\nFailed: {type(exc).__name__}: {exc}\n\n✅ Sent: {done} | ⚠️ Failed: {failed}", reply_markup=menu())
+                continue
+            await status.edit_text(f"✅ {filename}\n\nCompleted {index}/{total_files}\n✅ Sent: {done}\n⚠️ Failed: {failed}", reply_markup=menu())
+        await status.edit_text(f"✅ Completed\n\n📦 Files processed: {total_files}\n✅ Sent: {done}\n⚠️ Failed: {failed}\n\nDestination: {job.destination}", reply_markup=menu())
 
 @dp.message(CommandStart())
 async def start(message: Message):
@@ -531,9 +633,9 @@ async def setdest_cmd(message: Message):
     if len(parts) != 2:
         PENDING[uid] = "destination"
         return await message.answer("🎯 Send the destination username or chat ID, for example @mychannel or -1001234567890.", reply_markup=menu())
-    set_destination(uid, parts[1])
+    value = await set_destination(uid, parts[1])
     PENDING.pop(uid, None)
-    await message.answer(f"✅ Destination saved: {parts[1]}", reply_markup=menu())
+    await message.answer(f"✅ Permanent destination saved: {value}\n\nYou can change it anytime with 🎯 Destination.", reply_markup=menu())
 
 @dp.message(Command("cancel"))
 async def cancel_cmd(message: Message):
@@ -563,6 +665,7 @@ async def range_cmd(message: Message):
     if len(parts) != 4:
         PENDING[uid] = "range"
         return await message.answer("📦 Send the range as: @channel START_ID END_ID", reply_markup=menu())
+    await load_destination(uid)
     if not destination(uid):
         return await message.answer("Set a destination first with 🎯 Destination.", reply_markup=menu())
     try:
@@ -677,6 +780,7 @@ async def text_handler(message: Message):
             return await message.answer("Send a valid Telegram t.me message link.", reply_markup=menu())
     if not re.match(r"^https?://(?:www\.)?t\.me/", text):
         return await message.answer("Send a Telegram t.me message link or use the buttons below.", reply_markup=menu())
+    await load_destination(uid)
     if not destination(uid):
         return await message.answer("Set a destination first with 🎯 Destination.", reply_markup=menu())
 
@@ -686,9 +790,9 @@ async def text_handler(message: Message):
         await ensure_user_client()
         if bulk:
             peer, start_id, end_id = bulk
-            await status.edit_text(f"🔎 Resolving Telegram channel...\n📦 Range: {start_id}–{end_id}", reply_markup=menu())
-            source = await resolve_message_peer(peer)
-            await status.edit_text(f"🔎 Fetching messages {start_id}–{end_id}...", reply_markup=menu())
+            await status.edit_text(f"🔎 Resolving Telegram channel…\n📦 Range: {start_id}–{end_id}", reply_markup=menu())
+            source = await asyncio.wait_for(resolve_message_peer(peer), timeout=SCAN_TIMEOUT_SECONDS)
+            await status.edit_text(f"🔎 Fetching messages {start_id}–{end_id}…", reply_markup=menu())
             msgs = await asyncio.wait_for(
                 user_client.get_messages(source, ids=list(range(start_id, end_id + 1))),
                 timeout=SCAN_TIMEOUT_SECONDS,
@@ -698,15 +802,15 @@ async def text_handler(message: Message):
             return
 
         peer, mid = parse_link(text)
-        await status.edit_text("🔎 Resolving Telegram channel...", reply_markup=menu())
-        source = await resolve_message_peer(peer)
-        await status.edit_text("🔎 Fetching message...", reply_markup=menu())
+        await status.edit_text(f"🔎 Resolving Telegram channel…\n📌 Message: {mid}", reply_markup=menu())
+        source = await asyncio.wait_for(resolve_message_peer(peer), timeout=SCAN_TIMEOUT_SECONDS)
+        await status.edit_text(f"🔎 Fetching message {mid}…", reply_markup=menu())
         msg = await asyncio.wait_for(user_client.get_messages(source, ids=mid), timeout=SCAN_TIMEOUT_SECONDS)
         if not msg or not getattr(msg, "media", None):
             return await status.edit_text("That message does not contain downloadable media.", reply_markup=menu())
         await create_job(uid, source, [msg], status)
     except asyncio.TimeoutError:
-        await status.edit_text("⏱️ Telegram did not respond within the scan timeout. Check that the logged-in account can open this channel, then try again.", reply_markup=menu())
+        await status.edit_text("⏱️ Scan timed out after 35 seconds.\n\nCheck that the logged-in Telegram account can open this channel and try again.", reply_markup=menu())
     except (ValueError, RPCError) as exc:
         await status.edit_text(f"Could not resolve that message: {exc}", reply_markup=menu())
     except Exception as exc:
@@ -807,6 +911,8 @@ async def main():
     if not ALLOWED_USER_IDS:
         raise RuntimeError("Set TELEGRAM_ALLOWED_USER_IDS to at least one Telegram user ID.")
     await configure_command_menu()
+    for uid in ALLOWED_USER_IDS:
+        await load_destination(uid)
     try:
         session = await saved_session()
         if session:

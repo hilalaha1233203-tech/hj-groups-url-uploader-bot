@@ -43,7 +43,7 @@ class PlaybookClient:
             return {}
         return response.json()
 
-    async def upload_file(self, file_path: str | Path, title: str | None = None) -> str:
+    async def upload_file(self, file_path: str | Path, title: str | None = None, progress_callback=None) -> str:
         path = Path(file_path)
         if not path.is_file():
             raise PlaybookError(f"File does not exist: {path}")
@@ -104,6 +104,8 @@ class PlaybookClient:
         token = asset.get("token")
         if not token:
             raise PlaybookError("Playbook upload completed without an asset token")
+        if progress_callback:
+            progress_callback(size, size)
         return str(token)
 
     async def get_asset(self, asset_token: str) -> dict[str, Any]:
