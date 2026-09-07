@@ -20,6 +20,7 @@ from aiogram.types import (
 )
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon import utils
 from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError, AuthKeyUnregisteredError, AuthKeyInvalidError, SessionRevokedError
 from telegram_session_store import session_store
 from playbook_client import PlaybookClient, PlaybookError
@@ -81,26 +82,33 @@ def menu():
         input_field_placeholder="Choose a function…",
     )
 
-def allowed(uid):
+def access_role(uid):
     if not uid:
-        return False
+        return None
     uid = int(uid)
     if OWNER_USER_ID and uid == OWNER_USER_ID:
-        return True
+        return "owner"
     record = ACCESS_CACHE.get(uid)
     if not record or not record.get("active", False):
-        return False
+        return None
     expires_at = record.get("expires_at")
-    if expires_at is None:
-        return True
-    if isinstance(expires_at, str):
-        try:
-            expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-        except ValueError:
-            return False
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    return datetime.now(timezone.utc) < expires_at
+    if expires_at is not None:
+        if isinstance(expires_at, str):
+            try:
+                expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) >= expires_at:
+            return None
+    return str(record.get("role", "vip")).lower()
+
+def allowed(uid):
+    return access_role(uid) in {"owner", "vip", "user"}
+
+def is_owner(uid):
+    return access_role(uid) == "owner"
 
 async def load_access_state():
     global OWNER_USER_ID
@@ -254,19 +262,40 @@ async def ensure_user_client():
 async def resolve_message_peer(peer):
     try:
         return await asyncio.wait_for(user_client.get_input_entity(peer), timeout=SCAN_TIMEOUT_SECONDS)
-    except (ValueError, TypeError):
-        target_id = int(peer) if str(peer).lstrip("-").isdigit() else None
+    except (ValueError, TypeError, KeyError):
+        target_text = str(peer).strip()
+        target_id = int(target_text) if target_text.lstrip("-").isdigit() else None
         if target_id is None:
-            return await asyncio.wait_for(user_client.get_entity(peer), timeout=SCAN_TIMEOUT_SECONDS)
+            return await asyncio.wait_for(user_client.get_entity(target_text), timeout=SCAN_TIMEOUT_SECONDS)
+
+        raw_id, peer_cls = utils.resolve_id(target_id)
+        if peer_cls is not None:
+            try:
+                return await asyncio.wait_for(
+                    user_client.get_input_entity(peer_cls(raw_id)),
+                    timeout=SCAN_TIMEOUT_SECONDS,
+                )
+            except (ValueError, TypeError, KeyError):
+                pass
+
         async def find_in_dialogs():
             async for dialog in user_client.iter_dialogs():
                 entity = getattr(dialog, "entity", None)
-                if entity is not None and getattr(entity, "id", None) == abs(target_id) and getattr(dialog, "id", None) == target_id:
-                    return entity
+                if entity is None:
+                    continue
+                try:
+                    if utils.get_peer_id(entity, add_mark=True) == target_id:
+                        return entity
+                except Exception:
+                    continue
             return None
+
         entity = await asyncio.wait_for(find_in_dialogs(), timeout=SCAN_TIMEOUT_SECONDS)
         if entity is None:
-            raise ValueError(f"Telegram channel/chat {peer} is not in the logged-in account's dialogs. Make sure the account has access to that channel.")
+            raise ValueError(
+                f"Telegram channel/chat {peer} is not accessible from the logged-in account. "
+                "The account must be a member of the channel and the channel must be visible in Telegram."
+            )
         return entity
 
 def safe_filename(msg):
@@ -451,6 +480,14 @@ async def start(message: Message):
         return
     await message.answer("HJ GROUPS Media Collector\n\nChoose a function from the buttons below or send a Telegram message link directly.", reply_markup=menu())
 
+@dp.message(Command("id"))
+async def id_cmd(message: Message):
+    uid = message.from_user.id if message.from_user else None
+    if not uid:
+        return
+    role = access_role(uid) or "not authorized"
+    await message.answer(f"🆔 Your Telegram user ID: {uid}\n\nRole: {role}", reply_markup=menu())
+
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
@@ -463,7 +500,7 @@ async def help_cmd(message: Message):
 @dp.message(Command("grant"))
 async def grant_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if uid != OWNER_USER_ID:
+    if not is_owner(uid):
         return await message.answer("⛔ Owner only.")
     parts = (message.text or "").split()
     if len(parts) not in (2, 3) or not parts[1].isdigit() or int(parts[1]) <= 0:
@@ -473,15 +510,15 @@ async def grant_cmd(message: Message):
     if len(parts) == 3 and days is None:
         return await message.answer("Days must be a positive number.", reply_markup=menu())
     expiry = datetime.now(timezone.utc) + timedelta(days=days) if days else None
-    await session_store.set_access(target, active=True, expires_at=expiry, role="user")
-    ACCESS_CACHE[target] = {"user_id": target, "active": True, "expires_at": expiry, "role": "user"}
+    await session_store.set_access(target, active=True, expires_at=expiry, role="vip")
+    ACCESS_CACHE[target] = {"user_id": target, "active": True, "expires_at": expiry, "role": "vip"}
     label = "permanent" if expiry is None else f"until {expiry.isoformat()}"
     await message.answer(f"✅ Access granted to {target}: {label}", reply_markup=menu())
 
 @dp.message(Command("revoke"))
 async def revoke_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if uid != OWNER_USER_ID:
+    if not is_owner(uid):
         return await message.answer("⛔ Owner only.")
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2 or not parts[1].strip().isdigit():
@@ -496,7 +533,7 @@ async def revoke_cmd(message: Message):
 @dp.message(Command("users"))
 async def users_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
-    if uid != OWNER_USER_ID:
+    if not is_owner(uid):
         return await message.answer("⛔ Owner only.")
     rows = await session_store.list_access()
     lines = []
@@ -506,9 +543,9 @@ async def users_cmd(message: Message):
         elif not row.get("active"):
             status = "REVOKED"
         elif row.get("expires_at") is None:
-            status = "ACTIVE / PERMANENT"
+            status = "VIP / PERMANENT"
         else:
-            status = f"ACTIVE / {row['expires_at']}"
+            status = f"VIP / {row['expires_at']}"
         lines.append(f"{row['user_id']} — {status}")
     await message.answer("👥 Saved access:\n\n" + ("\n".join(lines) if lines else "No users saved."), reply_markup=menu())
 
@@ -828,7 +865,7 @@ async def cancel_callback(callback: CallbackQuery):
 
 async def configure_command_menu():
     commands = [
-        BotCommand(command="start", description="Open main menu"), BotCommand(command="help", description="Show help"),
+        BotCommand(command="start", description="Open main menu"), BotCommand(command="id", description="Show your Telegram user ID"), BotCommand(command="help", description="Show help"),
         BotCommand(command="login", description="Login Telegram account"), BotCommand(command="otp", description="Submit Telegram OTP"),
         BotCommand(command="2fa", description="Submit Telegram 2FA"), BotCommand(command="session", description="Check saved session"),
         BotCommand(command="setdestination", description="Set delivery destination"), BotCommand(command="range", description="Scan a message range"),
