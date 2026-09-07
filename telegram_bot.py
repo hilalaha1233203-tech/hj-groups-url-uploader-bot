@@ -38,7 +38,7 @@ BOT_DELETE_SECONDS = max(0, int(os.getenv("TELEGRAM_BOT_DELETE_SECONDS", "3600")
 MAX_BULK_MESSAGES = max(1, int(os.getenv("TELEGRAM_MAX_BULK_MESSAGES", "500")))
 MAX_ACTIVE_JOBS = max(1, int(os.getenv("TELEGRAM_MAX_ACTIVE_JOBS", "1")))
 SCAN_TIMEOUT_SECONDS = max(10, int(os.getenv("TELEGRAM_SCAN_TIMEOUT_SECONDS", "35")))
-STATE_FILE = Path(os.getenv("TELEGRAM_STATE_FILE", "telegram_media_state.json"))
+STATE_FILE = Path(os.getenv("TELEGRAM_STATE_FILE", "/data/telegram_media_state.json"))
 
 ENV_DESTINATIONS = {}
 for item in os.getenv("TELEGRAM_USER_DESTINATIONS", "").split("|"):
@@ -104,72 +104,6 @@ def access_role(uid):
             return None
     return str(record.get("role", "vip")).lower()
 
-def access_role(uid):
-    if not uid:
-        return None
-    uid = int(uid)
-    if OWNER_USER_ID and uid == OWNER_USER_ID:
-        return "owner"
-    record = ACCESS_CACHE.get(uid)
-    if not record or not record.get("active", False):
-        return None
-    expires_at = record.get("expires_at")
-    if expires_at is not None:
-        if isinstance(expires_at, str):
-            try:
-                expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-            except ValueError:
-                return None
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if datetime.now(timezone.utc) >= expires_at:
-            return None
-    return str(record.get("role", "vip")).lower()
-
-def access_role(uid):
-    if not uid:
-        return None
-    uid = int(uid)
-    if OWNER_USER_ID and uid == OWNER_USER_ID:
-        return "owner"
-    record = ACCESS_CACHE.get(uid)
-    if not record or not record.get("active", False):
-        return None
-    expires_at = record.get("expires_at")
-    if expires_at is not None:
-        if isinstance(expires_at, str):
-            try:
-                expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-            except ValueError:
-                return None
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if datetime.now(timezone.utc) >= expires_at:
-            return None
-    return str(record.get("role", "vip")).lower()
-
-def access_role(uid):
-    if not uid:
-        return None
-    uid = int(uid)
-    if OWNER_USER_ID and uid == OWNER_USER_ID:
-        return "owner"
-    record = ACCESS_CACHE.get(uid)
-    if not record or not record.get("active", False):
-        return None
-    expires_at = record.get("expires_at")
-    if expires_at is not None:
-        if isinstance(expires_at, str):
-            try:
-                expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-            except ValueError:
-                return None
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if datetime.now(timezone.utc) >= expires_at:
-            return None
-    return str(record.get("role", "vip")).lower()
-
 def allowed(uid):
     return access_role(uid) in {"owner", "vip", "user"}
 
@@ -179,10 +113,12 @@ def is_owner(uid):
 async def load_access_state():
     global OWNER_USER_ID
     rows = await session_store.list_access()
+    explicit_owner = EXPLICIT_OWNER_ID
     for row in rows:
-        ACCESS_CACHE[int(row["user_id"])] = row
-        if row.get("role") == "owner":
-            OWNER_USER_ID = int(row["user_id"])
+        row_id = int(row["user_id"])
+        ACCESS_CACHE[row_id] = row
+        if not explicit_owner and row.get("role") == "owner":
+            OWNER_USER_ID = row_id
     if not OWNER_USER_ID:
         raise RuntimeError("No Voroa owner is configured. Set VOROA_OWNER_USER_ID or TELEGRAM_ALLOWED_USER_IDS.")
     await session_store.set_access(OWNER_USER_ID, active=True, expires_at=None, role="owner")
@@ -206,8 +142,9 @@ STATE = load_state()
 
 def save_state():
     try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         STATE_FILE.write_text(json.dumps(STATE, indent=2), encoding="utf-8")
-    except OSError:
+    except (OSError, TypeError):
         pass
 
 def destination(uid):
@@ -333,17 +270,12 @@ async def resolve_message_peer(peer):
         target_id = int(target_text) if target_text.lstrip("-").isdigit() else None
         if target_id is None:
             return await asyncio.wait_for(user_client.get_entity(target_text), timeout=SCAN_TIMEOUT_SECONDS)
-
         raw_id, peer_cls = utils.resolve_id(target_id)
         if peer_cls is not None:
             try:
-                return await asyncio.wait_for(
-                    user_client.get_input_entity(peer_cls(raw_id)),
-                    timeout=SCAN_TIMEOUT_SECONDS,
-                )
+                return await asyncio.wait_for(user_client.get_input_entity(peer_cls(raw_id)), timeout=SCAN_TIMEOUT_SECONDS)
             except (ValueError, TypeError, KeyError):
                 pass
-
         async def find_in_dialogs():
             async for dialog in user_client.iter_dialogs():
                 entity = getattr(dialog, "entity", None)
@@ -355,7 +287,6 @@ async def resolve_message_peer(peer):
                 except Exception:
                     continue
             return None
-
         entity = await asyncio.wait_for(find_in_dialogs(), timeout=SCAN_TIMEOUT_SECONDS)
         if entity is None:
             raise ValueError(
@@ -366,9 +297,10 @@ async def resolve_message_peer(peer):
 
 def safe_filename(msg):
     name = getattr(getattr(msg, "file", None), "name", None)
-    if name:
-        return str(name)
-    return f"telegram-{getattr(msg, 'id', 'media')}"
+    if not name:
+        name = f"telegram-{getattr(msg, 'id', 'media')}"
+    name = re.sub(r"[\\/:*?\"<>|\x00\r\n]+", "_", str(name)).strip(" .")
+    return name[:240] or f"telegram-{getattr(msg, 'id', 'media')}"
 
 def format_eta(seconds):
     if seconds is None or seconds < 0:
@@ -473,13 +405,15 @@ async def send_destination(msg, dest, status=None, index=1, total_files=1):
         download_kwargs = {"file": str(path)}
         if download_cb:
             download_kwargs["progress_callback"] = download_cb
-        await user_client.download_media(msg, **download_kwargs)
+        result = await user_client.download_media(msg, **download_kwargs)
+        if result is None or not path.is_file():
+            raise RuntimeError("Telegram media download did not produce a local file.")
         client = PlaybookClient(token=token, org_slug=org)
         upload_started = time.monotonic()
         await update(f"📄 {filename}\n\n☁️ Uploading to temporary storage…\n⏳ calculating…")
         asset_token = await client.upload_file(path, title=filename, progress_callback=(make_progress_callback(status, filename, "☁️ Uploading to temporary storage…", upload_started) if status is not None else None))
         asset = {}
-        for poll in range(30):
+        for _poll in range(30):
             asset = await client.get_asset(asset_token)
             if not asset.get("is_skeleton", False):
                 break
@@ -492,10 +426,15 @@ async def send_destination(msg, dest, status=None, index=1, total_files=1):
             raise PlaybookError(str(asset.get("source_error") or "Playbook asset has no display_url"))
         await update(f"📄 {filename}\n\n📤 Sending to destination…\n⏳ finalizing…")
         sent = await flood(lambda: user_client.send_file(dest, url, name=filename, caption=caption(msg)))
-        try:
-            await client.delete_asset(asset_token)
-        except Exception:
-            pass
+        for _attempt in range(3):
+            try:
+                await client.delete_asset(asset_token)
+                break
+            except Exception as exc:
+                if _attempt == 2:
+                    print(f"[Voroa] Playbook asset cleanup failed for {asset_token}: {type(exc).__name__}: {exc}", flush=True)
+                else:
+                    await asyncio.sleep(1 + _attempt)
         if status is not None:
             await update(f"✅ {filename}\n\n📤 Sent successfully\n⏱️ {int(time.monotonic() - started_at)}s")
         return sent
@@ -560,7 +499,9 @@ async def help_cmd(message: Message):
     if not allowed(uid):
         await message.answer("⛔ You are not authorized to use this bot.")
         return
-    extra = "\n\n👑 Owner commands:\n/grant USER_ID [days] — permanent or time-limited access\n/revoke USER_ID — remove access\n/users — list saved access"
+    extra = ""
+    if is_owner(uid):
+        extra = "\n\n👑 Owner commands:\n/grant USER_ID [days] — permanent or time-limited access\n/revoke USER_ID — remove access\n/users — list saved access"
     await message.answer("HJ GROUPS Media Collector\n\n🔗 Scan Link — send a Telegram message link. Bulk links like .../471-480 or .../471 480 are supported.\n📦 Bulk Range — send: @channel START_ID END_ID.\n📋 Select Files — use after a scan, then send: 25,31,44.\n🎯 Destination — send @username or chat ID.\n🔐 Login — QR login.\n📱 Session — check the saved session.\n🚪 Logout — remove the saved Telegram session.\n❌ Cancel — cancel the current job or pending input." + extra, reply_markup=menu())
 
 @dp.message(Command("grant"))
@@ -573,7 +514,7 @@ async def grant_cmd(message: Message):
         return await message.answer("Usage: /grant USER_ID [days]\nWithout days = permanent access.", reply_markup=menu())
     target = int(parts[1])
     days = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else None
-    if len(parts) == 3 and days is None:
+    if len(parts) == 3 and (days is None or days <= 0):
         return await message.answer("Days must be a positive number.", reply_markup=menu())
     expiry = datetime.now(timezone.utc) + timedelta(days=days) if days else None
     await session_store.set_access(target, active=True, expires_at=expiry, role="vip")
@@ -704,9 +645,15 @@ async def twofa_cmd(message: Message):
             await qr_client.sign_in(password=parts[1].strip())
             await session_store.set(qr_client.session.save())
             PENDING.pop(uid, None); QR_CLIENTS.pop(uid, None)
+            try:
+                if qr_client.is_connected(): await qr_client.disconnect()
+            except Exception: pass
             await message.answer("Telegram account login successful via QR + 2FA. ✅", reply_markup=menu())
         except (AuthKeyUnregisteredError, AuthKeyInvalidError, SessionRevokedError):
             PENDING.pop(uid, None); QR_CLIENTS.pop(uid, None)
+            try:
+                if qr_client.is_connected(): await qr_client.disconnect()
+            except Exception: pass
             await message.answer("⚠️ Telegram invalidated the temporary QR session. Press 🔐 Login and scan a new QR code.", reply_markup=menu())
         except Exception as exc:
             await message.answer(f"2FA login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
@@ -725,10 +672,22 @@ async def logout_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
     if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.")
     try:
-        if user_client.is_connected(): await user_client.log_out()
+        if user_client.is_connected():
+            await user_client.log_out()
+    except Exception as exc:
+        print(f"[Voroa] Telegram logout request failed: {type(exc).__name__}: {exc}", flush=True)
     finally:
         await session_store.clear(); await session_store.clear_login(uid)
-    PENDING.pop(uid, None); await message.answer("Telegram account logged out and saved session removed. ✅", reply_markup=menu())
+        try:
+            if user_client.is_connected(): await user_client.disconnect()
+        except Exception: pass
+    PENDING.pop(uid, None)
+    qr_client = QR_CLIENTS.pop(uid, None)
+    if qr_client is not None:
+        try:
+            if qr_client.is_connected(): await qr_client.disconnect()
+        except Exception: pass
+    await message.answer("Telegram saved session removed. ✅", reply_markup=menu())
 
 @dp.message(Command("session"))
 async def session_cmd(message: Message):
@@ -761,7 +720,12 @@ async def setdest_cmd(message: Message):
 async def cancel_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
     if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.")
-    JOBS.pop(uid, None); PENDING.pop(uid, None); QR_CLIENTS.pop(uid, None)
+    JOBS.pop(uid, None); PENDING.pop(uid, None)
+    qr_client = QR_CLIENTS.pop(uid, None)
+    if qr_client is not None:
+        try:
+            if qr_client.is_connected(): await qr_client.disconnect()
+        except Exception: pass
     await message.answer("❌ Cancelled.", reply_markup=menu())
 
 @dp.message(Command("range"))
@@ -769,17 +733,20 @@ async def range_cmd(message: Message):
     uid = message.from_user.id if message.from_user else None
     if not allowed(uid): return await message.answer("⛔ You are not authorized to use this bot.")
     parts = (message.text or "").split()
-    if len(parts) != 3:
+    if len(parts) != 4:
         PENDING[uid] = "range"; return await message.answer("📦 Send: @channel START_ID END_ID", reply_markup=menu())
+    peer = parts[1].strip()
     try:
-        start_id, end_id = int(parts[1]), int(parts[2])
+        start_id, end_id = int(parts[2]), int(parts[3])
         if start_id <= 0 or end_id < start_id: raise ValueError("Invalid message ID range.")
         if end_id - start_id + 1 > MAX_BULK_MESSAGES: raise ValueError(f"Maximum range is {MAX_BULK_MESSAGES} messages.")
-        await ensure_user_client(); source = await asyncio.wait_for(user_client.get_entity(parts[1]), timeout=SCAN_TIMEOUT_SECONDS)
+        await ensure_user_client()
+        source = await asyncio.wait_for(resolve_message_peer(peer), timeout=SCAN_TIMEOUT_SECONDS)
         status = await message.answer("🔎 Scanning messages...", reply_markup=menu())
         msgs = await asyncio.wait_for(user_client.get_messages(source, ids=list(range(start_id, end_id + 1))), timeout=SCAN_TIMEOUT_SECONDS)
+        PENDING.pop(uid, None)
         await create_job(uid, source, [msg for msg in msgs if msg and getattr(msg, "media", None)], status)
-    except asyncio.TimeoutError: await message.answer("⏱️ Telegram did not respond within the scan timeout. Please try the range again.", reply_markup=menu())
+    except asyncio.TimeoutError: await message.answer(f"⏱️ Telegram did not respond within {SCAN_TIMEOUT_SECONDS} seconds. Please try the range again.", reply_markup=menu())
     except (ValueError, RPCError) as exc: await message.answer(f"Could not scan range: {exc}", reply_markup=menu())
     except Exception as exc:
         print(f"Range scan failed: {type(exc).__name__}: {exc}", flush=True); await message.answer(f"❌ Range scan failed: {type(exc).__name__}: {exc}", reply_markup=menu())
@@ -850,11 +817,16 @@ async def text_handler(message: Message):
         except Exception as exc: print(f"[Voroa] Status fallback send failed: {type(exc).__name__}: {exc}", flush=True)
     async def bounded(coro, timeout=SCAN_TIMEOUT_SECONDS):
         task = asyncio.create_task(coro)
-        try: return await asyncio.wait_for(task, timeout=timeout)
+        try:
+            return await asyncio.wait_for(task, timeout=timeout)
         except asyncio.TimeoutError:
             task.cancel()
-            try: await asyncio.wait_for(task, timeout=2)
-            except Exception: pass
+            try:
+                await asyncio.wait_for(task, timeout=2)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception:
+                pass
             try:
                 if user_client.is_connected(): await asyncio.wait_for(user_client.disconnect(), timeout=5)
             except Exception: pass
@@ -869,7 +841,7 @@ async def text_handler(message: Message):
         peer, mid = parse_link(text); await safe_status(f"🔎 Resolving Telegram channel…\n📌 Message: {mid}"); source = await bounded(resolve_message_peer(peer)); await safe_status(f"🔎 Fetching message {mid}…"); msg = await bounded(user_client.get_messages(source, ids=mid))
         if not msg or not getattr(msg, "media", None): return await safe_status("That message does not contain downloadable media.")
         await create_job(uid, source, [msg], status)
-    except asyncio.TimeoutError: await safe_status("⏱️ Telegram scan timed out after 35 seconds.\n\nThe scan was stopped safely instead of hanging. Check that the logged-in Telegram account can access this channel, then try again.")
+    except asyncio.TimeoutError: await safe_status(f"⏱️ Telegram scan timed out after {SCAN_TIMEOUT_SECONDS} seconds.\n\nThe scan was stopped safely instead of hanging. Check that the logged-in Telegram account can access this channel, then try again.")
     except (ValueError, RPCError) as exc: await safe_status(f"Could not resolve that message: {exc}")
     except Exception as exc:
         print(f"Scan failed: {type(exc).__name__}: {exc}", flush=True); await safe_status(f"❌ Scan failed: {type(exc).__name__}: {exc}")
@@ -926,7 +898,12 @@ async def cancel_callback(callback: CallbackQuery):
     if not allowed(uid): return await callback.answer("Not authorized", show_alert=True)
     owner = int(callback.data.split(":", 1)[1])
     if owner == uid:
-        JOBS.pop(uid, None); PENDING.pop(uid, None); QR_CLIENTS.pop(uid, None)
+        JOBS.pop(uid, None); PENDING.pop(uid, None)
+        qr_client = QR_CLIENTS.pop(uid, None)
+        if qr_client is not None:
+            try:
+                if qr_client.is_connected(): await qr_client.disconnect()
+            except Exception: pass
     await callback.message.edit_text("❌ Cancelled.", reply_markup=menu()); await callback.answer()
 
 async def configure_command_menu():
