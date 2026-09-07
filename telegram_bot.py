@@ -150,6 +150,24 @@ def parse_link(value):
     private, username, mid = match.groups()
     return (f"-100{private}" if private else f"@{username}"), int(mid)
 
+def parse_bulk_link(value):
+    # Accept: t.me/c/123/471-480 and t.me/c/123/471 480
+    match = re.match(
+        r"^https?://(?:www\.)?t\.me/(?:c/(\d+)|([A-Za-z0-9_]{3,}))/(\d+)\s*(?:-|\s)\s*(\d+)(?:\?.*)?$",
+        value.strip(),
+    )
+    if not match:
+        return None
+    private, username, start_text, end_text = match.groups()
+    start_id, end_id = int(start_text), int(end_text)
+    if start_id <= 0 or end_id < start_id:
+        raise ValueError("Invalid Telegram message ID range.")
+    count = end_id - start_id + 1
+    if count > MAX_BULK_MESSAGES:
+        raise ValueError(f"Maximum range is {MAX_BULK_MESSAGES} messages.")
+    peer = f"-100{private}" if private else f"@{username}"
+    return peer, start_id, end_id
+
 async def flood(fn: Callable[[], Awaitable[Any]]):
     while True:
         try:
@@ -317,7 +335,7 @@ async def help_cmd(message: Message):
         await message.answer("⛔ You are not authorized to use this bot.")
         return
     await message.answer(
-        "HJ GROUPS Media Collector\n\n🔗 Scan Link — send a Telegram message link.\n📦 Bulk Range — send: @channel START_ID END_ID.\n📋 Select Files — use after a scan, then send: 25,31,44.\n🎯 Destination — send @username or chat ID.\n🔐 Login — send your Telegram phone number.\n📱 Session — check the saved session.\n🚪 Logout — remove the saved Telegram session.\n❌ Cancel — cancel the current job or pending input.",
+        "HJ GROUPS Media Collector\n\n🔗 Scan Link — send a Telegram message link. Bulk links like .../471-480 or .../471 480 are supported.\n📦 Bulk Range — send: @channel START_ID END_ID.\n📋 Select Files — use after a scan, then send: 25,31,44.\n🎯 Destination — send @username or chat ID.\n🔐 Login — send your Telegram phone number.\n📱 Session — check the saved session.\n🚪 Logout — remove the saved Telegram session.\n❌ Cancel — cancel the current job or pending input.",
         reply_markup=menu(),
     )
 
@@ -608,7 +626,7 @@ async def button_scan(message: Message):
     if not allowed(uid):
         return
     PENDING[uid] = "scan"
-    await message.answer("🔗 Send the Telegram message link (t.me/.../message_id).", reply_markup=menu())
+    await message.answer("🔗 Send a Telegram link. For bulk use .../471-480 or .../471 480.", reply_markup=menu())
 
 @dp.message(F.text == "📦 Bulk Range")
 async def button_range(message: Message):
@@ -661,9 +679,24 @@ async def text_handler(message: Message):
         return await message.answer("Send a Telegram t.me message link or use the buttons below.", reply_markup=menu())
     if not destination(uid):
         return await message.answer("Set a destination first with 🎯 Destination.", reply_markup=menu())
-    status = await message.answer("🔎 Scanning message...", reply_markup=menu())
+
+    bulk = parse_bulk_link(text)
+    status = await message.answer("🔎 Scanning bulk messages..." if bulk else "🔎 Scanning message...", reply_markup=menu())
     try:
         await ensure_user_client()
+        if bulk:
+            peer, start_id, end_id = bulk
+            await status.edit_text(f"🔎 Resolving Telegram channel...\n📦 Range: {start_id}–{end_id}", reply_markup=menu())
+            source = await resolve_message_peer(peer)
+            await status.edit_text(f"🔎 Fetching messages {start_id}–{end_id}...", reply_markup=menu())
+            msgs = await asyncio.wait_for(
+                user_client.get_messages(source, ids=list(range(start_id, end_id + 1))),
+                timeout=SCAN_TIMEOUT_SECONDS,
+            )
+            media_msgs = [msg for msg in msgs if msg and getattr(msg, "media", None)]
+            await create_job(uid, source, media_msgs, status)
+            return
+
         peer, mid = parse_link(text)
         await status.edit_text("🔎 Resolving Telegram channel...", reply_markup=menu())
         source = await resolve_message_peer(peer)
