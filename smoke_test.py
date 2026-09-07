@@ -8,10 +8,8 @@ BOT = (ROOT / "telegram_bot.py").read_text(encoding="utf-8")
 STORE = (ROOT / "telegram_session_store.py").read_text(encoding="utf-8")
 PLAYBOOK = (ROOT / "playbook_client.py").read_text(encoding="utf-8")
 
-compile(BOT, "telegram_bot.py", "exec")
-compile(STORE, "telegram_session_store.py", "exec")
-compile(PLAYBOOK, "playbook_client.py", "exec")
-compile((ROOT / "start.py").read_text(encoding="utf-8"), "start.py", "exec")
+for path in ("telegram_bot.py", "telegram_session_store.py", "playbook_client.py", "start.py"):
+    compile((ROOT / path).read_text(encoding="utf-8"), path, "exec")
 
 module = ast.parse(BOT)
 needed = {"parse_link", "parse_bulk_link", "format_eta", "safe_filename"}
@@ -52,7 +50,6 @@ safe = safe_filename(DummyMessage("../folder\\evil:name?.mp4"))
 assert "/" not in safe and "\\" not in safe and ".." not in safe
 assert len(safe) <= 240
 
-# Authorization/persistence assertions.
 assert BOT.count("def access_role(uid):") == 1
 assert "def is_owner(uid):" in BOT
 assert "if not is_owner(uid):" in BOT
@@ -63,20 +60,22 @@ assert "MongoDB connected" in STORE
 assert "local mirror" in STORE
 assert "/data/voroa_session_store.json" in STORE
 assert "_sync_local_to_mongo" in STORE
-assert "if self._mongo_healthy:" in STORE
+assert "_local_tombstone" in STORE
+assert 'await self._collection.delete_one({"_id": key})' in STORE
+assert "local_ts > remote_ts" in STORE
 
-# Range-command regression checks.
 assert "if len(parts) != 4:" in BOT
 assert "peer = parts[1].strip()" in BOT
 assert "start_id, end_id = int(parts[2]), int(parts[3])" in BOT
 assert "resolve_message_peer(peer)" in BOT
 assert "get_entity(parts[1])" not in BOT
 
-# Timeout/cancellation regression check.
 assert "asyncio.CancelledError" in BOT
 assert "timed out after {SCAN_TIMEOUT_SECONDS} seconds" in BOT
+assert "BotCommandScopeChat" in BOT
+assert "set_my_commands(owner_commands, scope=BotCommandScopeChat(chat_id=OWNER_USER_ID))" in BOT
+assert "general_commands" in BOT
 
-# Playbook signed-upload protocol assertions based on the current API contract.
 assert "assets/upload_prepare" in PLAYBOOK
 assert "assets/upload_complete" in PLAYBOOK
 assert "x-goog-resumable" in PLAYBOOK
@@ -87,4 +86,4 @@ assert "x-amz-meta-extension" in PLAYBOOK
 assert "x-amz-meta-encrypted-organization-metadata" in PLAYBOOK
 assert "class ProgressFileStream(httpx.AsyncByteStream)" in PLAYBOOK
 
-print("Voroa smoke checks: PASS (parser/ETA + range + filename safety + authorization/persistence + Playbook upload assertions)")
+print("Voroa smoke checks: PASS (syntax + parsers + range + filenames + access + command scoping + persistence recovery + Playbook contract assertions)")
