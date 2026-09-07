@@ -22,7 +22,6 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
-          import re
 
           p = Path('telegram_bot.py')
           s = p.read_text(encoding='utf-8')
@@ -30,8 +29,9 @@ jobs:
           if 'from telethon import utils' not in s:
               s = s.replace('from telethon.sessions import StringSession\n', 'from telethon.sessions import StringSession\nfrom telethon import utils\n', 1)
 
-          allowed_re = re.compile(r'def allowed\(uid\):\n(?:    .*\n)+?(?=async def load_access_state\(\):)', re.M)
-          allowed_block = '''def access_role(uid):
+          start = s.index('def allowed(uid):')
+          end = s.index('async def load_access_state():', start)
+          s = s[:start] + '''def access_role(uid):
               if not uid:
                   return None
               uid = int(uid)
@@ -59,14 +59,11 @@ jobs:
           def is_owner(uid):
               return access_role(uid) == "owner"
 
-          '''
-          if 'def access_role(uid):' not in s:
-              s, n = allowed_re.subn(allowed_block, s, count=1)
-              if n != 1:
-                  raise SystemExit('Could not locate allowed() block')
+          ''' + s[end:]
 
-          resolver_re = re.compile(r'async def resolve_message_peer\(peer\):\n(?:    .*\n)+?(?=def safe_filename\(msg\):)', re.M)
-          resolver_block = '''async def resolve_message_peer(peer):
+          start = s.index('async def resolve_message_peer(peer):')
+          end = s.index('def safe_filename(msg):', start)
+          s = s[:start] + '''async def resolve_message_peer(peer):
               try:
                   return await asyncio.wait_for(user_client.get_input_entity(peer), timeout=SCAN_TIMEOUT_SECONDS)
               except (ValueError, TypeError, KeyError):
@@ -105,15 +102,10 @@ jobs:
                       )
                   return entity
 
-          '''
-          if 'raw_id, peer_cls = utils.resolve_id(target_id)' not in s:
-              s, n = resolver_re.subn(resolver_block, s, count=1)
-              if n != 1:
-                  raise SystemExit('Could not locate resolve_message_peer() block')
+          ''' + s[end:]
 
           s = s.replace('if uid != OWNER_USER_ID:\n        return await message.answer("⛔ Owner only.")', 'if not is_owner(uid):\n        return await message.answer("⛔ Owner only.")')
-          s = s.replace('await session_store.set_access(target, active=True, expires_at=expiry, role="user")', 'await session_store.set_access(target, active=True, expires_at=expiry, role="vip")')
-          s = s.replace('ACCESS_CACHE[target] = {"user_id": target, "active": True, "expires_at": expiry, "role": "user"}', 'ACCESS_CACHE[target] = {"user_id": target, "active": True, "expires_at": expiry, "role": "vip"}')
+          s = s.replace('role="user")\n    ACCESS_CACHE[target] = {"user_id": target, "active": True, "expires_at": expiry, "role": "user"}', 'role="vip")\n    ACCESS_CACHE[target] = {"user_id": target, "active": True, "expires_at": expiry, "role": "vip"}')
           s = s.replace('status = "ACTIVE / PERMANENT"', 'status = "VIP / PERMANENT"')
           s = s.replace('status = f"ACTIVE / {row[\'expires_at\']}"', 'status = f"VIP / {row[\'expires_at\']}"')
 
@@ -129,13 +121,9 @@ jobs:
 
           @dp.message(Command("help"))
           '''
-              if marker not in s:
-                  raise SystemExit('Could not insert /id handler')
               s = s.replace(marker, handler, 1)
 
           s = s.replace('BotCommand(command="start", description="Open main menu"), BotCommand(command="help", description="Show help"),', 'BotCommand(command="start", description="Open main menu"), BotCommand(command="id", description="Show your Telegram user ID"), BotCommand(command="help", description="Show help"),', 1)
-          s = s.replace('role="user")\n            ACCESS_CACHE[uid] = {"user_id": uid, "active": True, "expires_at": None, "role": "user"}', 'role="vip")\n            ACCESS_CACHE[uid] = {"user_id": uid, "active": True, "expires_at": None, "role": "vip"}', 1)
-
           compile(s, 'telegram_bot.py', 'exec')
           p.write_text(s, encoding='utf-8')
           PY
