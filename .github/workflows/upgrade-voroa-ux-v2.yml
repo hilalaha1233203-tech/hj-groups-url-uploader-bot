@@ -1,0 +1,66 @@
+name: Upgrade Voroa UX V2
+on:
+  push:
+    branches: [main]
+jobs:
+  upgrade:
+    if: "!contains(github.event.head_commit.message, '[skip voroa-ux]')"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Apply UX patch
+        run: python .github/scripts/upgrade_voroa_ux.py
+      - name: Make Playbook progress API compatible
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('playbook_client.py')
+          s = p.read_text(encoding='utf-8')
+          s = s.replace('    async def upload_file(self, file_path: str | Path, title: str | None = None) -> str:\n', '    async def upload_file(self, file_path: str | Path, title: str | None = None, progress_callback=None) -> str:\n', 1)
+          s = s.replace('        return str(token)\n\n    async def get_asset', '        if progress_callback:\n            progress_callback(size, size)\n        return str(token)\n\n    async def get_asset', 1)
+          p.write_text(s, encoding='utf-8')
+          assert 'progress_callback=None' in s
+          PY
+      - name: Compile
+        run: python -m py_compile start.py telegram_bot.py telegram_session_store.py playbook_client.py
+      - name: 100x functional parser test
+        run: |
+          python - <<'PY'
+          import telegram_bot as tb
+          for _ in range(100):
+              assert tb.parse_bulk_link('https://t.me/c/4433695631/471-480') == ('-1004433695631', 471, 480)
+              assert tb.parse_bulk_link('https://t.me/c/4433695631/471 480') == ('-1004433695631', 471, 480)
+              assert tb.parse_bulk_link('https://t.me/c/4433695631/471') is None
+              assert tb.parse_link('https://t.me/c/4433695631/471') == ('-1004433695631', 471)
+          print('100x functional parser test passed.')
+          PY
+      - name: Source and API assertions
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          bot = Path('telegram_bot.py').read_text(encoding='utf-8')
+          store = Path('telegram_session_store.py').read_text(encoding='utf-8')
+          playbook = Path('playbook_client.py').read_text(encoding='utf-8')
+          for x in ['DESTINATIONS = {}', 'def safe_filename(msg):', 'def format_eta(seconds):', 'progress_callback', 'Permanent destination saved', 'Scan timed out after 35 seconds']:
+              assert x in bot, x
+          for x in ['async def get_destination(self, user_id: int)', 'async def set_destination(self, user_id: int, destination: str)']:
+              assert x in store, x
+          assert 'progress_callback=None' in playbook
+          print('Source and API assertions passed.')
+          PY
+      - name: Commit only validated source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add telegram_bot.py telegram_session_store.py playbook_client.py
+          git reset -- .github/scripts/upgrade_voroa_ux.py .github/scripts/patch_playbook_progress.py .github/workflows/upgrade-voroa-ux-v2.yml .github/workflows/upgrade-voroa-ux.yml
+          git diff --cached --check
+          git commit -m "Harden destination persistence and transfer progress [skip voroa-ux]"
+          git push
