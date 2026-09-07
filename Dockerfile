@@ -12,4 +12,4 @@ RUN python -m pip install --upgrade pip && \
 
 COPY . .
 
-CMD ["python", "telegram_bot.py"]
+CMD ["python", "start.py"]
