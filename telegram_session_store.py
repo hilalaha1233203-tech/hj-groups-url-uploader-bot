@@ -1,18 +1,11 @@
-"""Persistent Voroa state with MongoDB-first storage and local fallback.
-
-MongoDB remains the preferred durable store. When MongoDB is temporarily
-unreachable (for example Atlas TLS/network-access problems), the bot must
-still start and remain usable instead of crashing before Telegram polling.
-Local fallback is best-effort and intended to bridge outages; once MongoDB is
-available again, future writes go back to MongoDB.
-"""
+"""Persistent Voroa state with MongoDB-first storage and durable local mirroring."""
 from __future__ import annotations
 
 import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Callable, Awaitable
 
 import motor.motor_asyncio
 from pymongo.errors import PyMongoError
@@ -22,7 +15,9 @@ DB_NAME = os.getenv("TELEGRAM_SESSION_DB_NAME", "hj_groups_url_uploader").strip(
 COLLECTION_NAME = os.getenv("TELEGRAM_SESSION_COLLECTION", "telegram_sessions").strip()
 TIMEOUT_MS = int(os.getenv("TELEGRAM_SESSION_DB_TIMEOUT_MS", "10000"))
 CONNECT_TIMEOUT_MS = int(os.getenv("TELEGRAM_SESSION_DB_CONNECT_TIMEOUT_MS", "10000"))
-LOCAL_FILE = Path(os.getenv("TELEGRAM_LOCAL_STATE_FILE", "/tmp/voroa_session_store.json"))
+# Voroa service filesystems are ephemeral. Use /data when a persistent disk is
+# attached; operators can override this with TELEGRAM_LOCAL_STATE_FILE.
+LOCAL_FILE = Path(os.getenv("TELEGRAM_LOCAL_STATE_FILE", "/data/voroa_session_store.json"))
 
 
 class SessionStore:
@@ -47,8 +42,8 @@ class SessionStore:
         try:
             LOCAL_FILE.parent.mkdir(parents=True, exist_ok=True)
             LOCAL_FILE.write_text(json.dumps(self._local, indent=2, default=str), encoding="utf-8")
-        except (OSError, TypeError):
-            pass
+        except (OSError, TypeError) as exc:
+            print(f"[Voroa] Local state write failed: {type(exc).__name__}: {exc}", flush=True)
 
     def _build_client(self) -> None:
         if not URI:
@@ -91,22 +86,27 @@ class SessionStore:
             self._mongo_healthy = False
             print("[Voroa] MongoDB not configured; using local fallback storage.", flush=True)
             return False
-        try:
-            await self._client.admin.command("ping")
-            self._last_error = None
-            self._mongo_healthy = True
-            print("[Voroa] MongoDB connected.", flush=True)
-            return True
-        except Exception as exc:
-            self._last_error = exc
-            self._mongo_healthy = False
-            print(
-                f"[Voroa] MongoDB unavailable; continuing with local fallback: {type(exc).__name__}: {exc}",
-                flush=True,
-            )
-            return False
+        for attempt in range(1, 4):
+            try:
+                await self._client.admin.command("ping")
+                self._last_error = None
+                self._mongo_healthy = True
+                print(f"[Voroa] MongoDB connected (attempt {attempt}).", flush=True)
+                return True
+            except Exception as exc:
+                self._last_error = exc
+                self._mongo_healthy = False
+                if attempt < 3:
+                    await __import__("asyncio").sleep(min(2 * attempt, 5))
+                else:
+                    print(
+                        f"[Voroa] MongoDB unavailable after {attempt} attempts; local mirror is active: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+        return False
 
-    async def _mongo(self, operation):
+    async def _mongo(self, operation: Callable[[Any], Awaitable[Any]]):
         if not self.configured:
             return None
         try:
@@ -117,6 +117,7 @@ class SessionStore:
         except (PyMongoError, OSError, TimeoutError) as exc:
             self._last_error = exc
             self._mongo_healthy = False
+            print(f"[Voroa] MongoDB operation unavailable; using local mirror: {type(exc).__name__}: {exc}", flush=True)
             return None
 
     async def get(self) -> Optional[str]:
@@ -124,8 +125,10 @@ class SessionStore:
         if isinstance(document, dict):
             value = document.get("session_string", "")
             return str(value).strip() or None
-        document = self._local_get("primary")
-        value = (document or {}).get("session_string", "")
+        if self._mongo_healthy:
+            return None
+        local = self._local_get("primary")
+        value = (local or {}).get("session_string", "")
         return str(value).strip() or None
 
     async def set(self, session_string: str) -> None:
@@ -134,17 +137,22 @@ class SessionStore:
             raise ValueError("Cannot persist an empty Telegram session.")
         payload = {"session_string": value, "updated_at": datetime.now(timezone.utc).isoformat()}
         result = await self._mongo(lambda c: c.update_one({"_id": "primary"}, {"$set": payload}, upsert=True))
-        if result is None:
-            self._local_set("primary", payload)
+        self._local_set("primary", payload)
+        if result is None and self.configured:
+            print("[Voroa] Telegram session saved only to local mirror because MongoDB is unavailable.", flush=True)
 
     async def clear(self) -> None:
         result = await self._mongo(lambda c: c.delete_one({"_id": "primary"}))
-        self._local_delete("primary") if result is None else None
+        self._local_delete("primary")
+        if result is None and self.configured and self._mongo_healthy is False:
+            print("[Voroa] Telegram primary session removed from local mirror; MongoDB delete pending availability.", flush=True)
 
     async def get_login(self, user_id: int) -> Optional[Dict[str, Any]]:
         key = f"login:{int(user_id)}"
         document = await self._mongo(lambda c: c.find_one({"_id": key}))
         if not isinstance(document, dict):
+            if self._mongo_healthy:
+                return None
             document = self._local_get(key)
         if not document:
             return None
@@ -163,19 +171,23 @@ class SessionStore:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         result = await self._mongo(lambda c: c.update_one({"_id": key}, {"$set": payload}, upsert=True))
-        if result is None:
-            self._local_set(key, payload)
+        self._local_set(key, payload)
+        if result is None and self.configured:
+            print(f"[Voroa] Login state {user_id} saved only to local mirror because MongoDB is unavailable.", flush=True)
 
     async def clear_login(self, user_id: int) -> None:
         key = f"login:{int(user_id)}"
         result = await self._mongo(lambda c: c.delete_one({"_id": key}))
-        if result is None:
-            self._local_delete(key)
+        self._local_delete(key)
+        if result is None and self.configured and not self._mongo_healthy:
+            print(f"[Voroa] Login state {user_id} removed locally; MongoDB delete is unavailable.", flush=True)
 
     async def get_destination(self, user_id: int) -> Optional[str]:
         key = f"destination:{int(user_id)}"
         document = await self._mongo(lambda c: c.find_one({"_id": key}))
         if not isinstance(document, dict):
+            if self._mongo_healthy:
+                return None
             document = self._local_get(key)
         value = (document or {}).get("destination", "")
         return str(value).strip() or None
@@ -187,19 +199,23 @@ class SessionStore:
         key = f"destination:{int(user_id)}"
         payload = {"destination": value, "updated_at": datetime.now(timezone.utc).isoformat()}
         result = await self._mongo(lambda c: c.update_one({"_id": key}, {"$set": payload}, upsert=True))
-        if result is None:
-            self._local_set(key, payload)
+        self._local_set(key, payload)
+        if result is None and self.configured:
+            print(f"[Voroa] Destination {user_id} saved only to local mirror because MongoDB is unavailable.", flush=True)
 
     async def clear_destination(self, user_id: int) -> None:
         key = f"destination:{int(user_id)}"
         result = await self._mongo(lambda c: c.delete_one({"_id": key}))
-        if result is None:
-            self._local_delete(key)
+        self._local_delete(key)
+        if result is None and self.configured and not self._mongo_healthy:
+            print(f"[Voroa] Destination {user_id} removed locally; MongoDB delete is unavailable.", flush=True)
 
     async def get_access(self, user_id: int) -> Optional[dict[str, Any]]:
         key = f"access:{int(user_id)}"
         document = await self._mongo(lambda c: c.find_one({"_id": key}))
         if not isinstance(document, dict):
+            if self._mongo_healthy:
+                return None
             document = self._local_get(key)
         if not document:
             return None
@@ -220,8 +236,9 @@ class SessionStore:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         result = await self._mongo(lambda c: c.update_one({"_id": key}, {"$set": payload}, upsert=True))
-        if result is None:
-            self._local_set(key, payload)
+        self._local_set(key, payload)
+        if result is None and self.configured:
+            print(f"[Voroa] Access state {user_id} saved only to local mirror because MongoDB is unavailable.", flush=True)
 
     async def list_access(self) -> list[dict[str, Any]]:
         if self._mongo_healthy and self._collection is not None:
@@ -239,6 +256,7 @@ class SessionStore:
             except (PyMongoError, OSError, TimeoutError) as exc:
                 self._last_error = exc
                 self._mongo_healthy = False
+                print(f"[Voroa] Access listing fell back to local mirror: {type(exc).__name__}: {exc}", flush=True)
         rows = []
         for document in self._local.values():
             if not isinstance(document, dict) or "user_id" not in document:
