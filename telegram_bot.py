@@ -19,7 +19,7 @@ from aiogram.types import (
 )
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError
+from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError, AuthKeyUnregisteredError, AuthKeyInvalidError, SessionRevokedError
 from telegram_session_store import session_store
 from playbook_client import PlaybookClient, PlaybookError
 import qrcode
@@ -51,6 +51,7 @@ DELETE_TASKS = set()
 LOGIN_LOCK = asyncio.Lock()
 PENDING = {}
 JOBS = {}
+QR_CLIENTS = {}
 
 @dataclass
 class Job:
@@ -289,11 +290,14 @@ async def help_cmd(message: Message):
     )
 
 async def qr_login_flow(message: Message, uid: int):
-    """QR login avoids Telegram's new-device code reuse/blocking path."""
+    """Start an isolated QR login client so other bot actions cannot replace its auth key."""
     async with LOGIN_LOCK:
+        qr_client = None
+        keep_client = False
         try:
-            await rebuild("")
-            qr_login = await user_client.qr_login()
+            qr_client = TelegramClient(StringSession(""), API_ID, API_HASH)
+            await qr_client.connect()
+            qr_login = await qr_client.qr_login()
             wait_task = asyncio.create_task(qr_login.wait(timeout=150))
             qr_path = Path(tempfile.gettempdir()) / f"telegram_qr_{uid}.png"
             img = qrcode.make(qr_login.url)
@@ -318,11 +322,13 @@ async def qr_login_flow(message: Message, uid: int):
 
             try:
                 await wait_task
-                session = user_client.session.save()
+                session = qr_client.session.save()
                 await session_store.set(session)
                 PENDING.pop(uid, None)
                 await message.answer("Telegram account login successful via QR. ✅", reply_markup=menu())
             except SessionPasswordNeededError:
+                QR_CLIENTS[uid] = qr_client
+                keep_client = True
                 PENDING[uid] = "2fa_qr"
                 await message.answer(
                     "✅ QR approved. Your Telegram account has 2FA enabled. Enter the 2FA password here or use /2fa your_password.",
@@ -330,10 +336,25 @@ async def qr_login_flow(message: Message, uid: int):
                 )
             except asyncio.TimeoutError:
                 await message.answer("⏱️ QR code expired. Press 🔐 Login to generate a new QR code.", reply_markup=menu())
+            except (AuthKeyUnregisteredError, AuthKeyInvalidError, SessionRevokedError) as exc:
+                QR_CLIENTS.pop(uid, None)
+                PENDING.pop(uid, None)
+                await message.answer("⚠️ The temporary Telegram QR session was invalidated. Press 🔐 Login and scan a new QR code.", reply_markup=menu())
             except Exception as exc:
+                QR_CLIENTS.pop(uid, None)
+                PENDING.pop(uid, None)
                 await message.answer(f"QR login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
         except Exception as exc:
+            QR_CLIENTS.pop(uid, None)
+            PENDING.pop(uid, None)
             await message.answer(f"Could not start QR login: {type(exc).__name__}: {exc}", reply_markup=menu())
+        finally:
+            if qr_client is not None and not keep_client:
+                try:
+                    if qr_client.is_connected():
+                        await qr_client.disconnect()
+                except Exception:
+                    pass
 
 @dp.message(Command("login"))
 async def login_cmd(message: Message):
@@ -384,11 +405,21 @@ async def twofa_cmd(message: Message):
         PENDING[uid] = PENDING.get(uid) or "2fa"
         return await message.answer("Enter your Telegram 2FA password.", reply_markup=menu())
     if PENDING.get(uid) == "2fa_qr":
-        try:
-            await user_client.sign_in(password=parts[1].strip())
-            await session_store.set(user_client.session.save())
+        qr_client = QR_CLIENTS.get(uid)
+        if qr_client is None or not qr_client.is_connected():
+            QR_CLIENTS.pop(uid, None)
             PENDING.pop(uid, None)
+            return await message.answer("⚠️ QR login session is no longer active. Press 🔐 Login and scan a new QR code.", reply_markup=menu())
+        try:
+            await qr_client.sign_in(password=parts[1].strip())
+            await session_store.set(qr_client.session.save())
+            PENDING.pop(uid, None)
+            QR_CLIENTS.pop(uid, None)
             await message.answer("Telegram account login successful via QR + 2FA. ✅", reply_markup=menu())
+        except (AuthKeyUnregisteredError, AuthKeyInvalidError, SessionRevokedError):
+            PENDING.pop(uid, None)
+            QR_CLIENTS.pop(uid, None)
+            await message.answer("⚠️ Telegram invalidated the temporary QR session. Press 🔐 Login and scan a new QR code.", reply_markup=menu())
         except Exception as exc:
             await message.answer(f"2FA login failed: {type(exc).__name__}: {exc}", reply_markup=menu())
         return
@@ -462,6 +493,13 @@ async def cancel_cmd(message: Message):
         return
     JOBS.pop(uid, None)
     PENDING.pop(uid, None)
+    qr_client = QR_CLIENTS.pop(uid, None)
+    if qr_client is not None:
+        try:
+            if qr_client.is_connected():
+                await qr_client.disconnect()
+        except Exception:
+            pass
     await session_store.clear_login(uid)
     await message.answer("❌ Current job cancelled.", reply_markup=menu())
 
