@@ -1,6 +1,7 @@
 """Persistent Voroa state with MongoDB-first storage and durable local mirroring."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from datetime import datetime, timezone
@@ -81,6 +82,29 @@ class SessionStore:
         self._local.pop(key, None)
         self._save_local()
 
+    async def _sync_local_to_mongo(self) -> None:
+        """Restore locally mirrored records that were saved while MongoDB was down.
+
+        MongoDB remains authoritative when a document already exists. The local
+        mirror is inserted only when the corresponding document is missing.
+        """
+        if not self._mongo_healthy or self._collection is None or not self._local:
+            return
+        for key, payload in list(self._local.items()):
+            if not isinstance(payload, dict):
+                continue
+            try:
+                await self._collection.update_one(
+                    {"_id": key},
+                    {"$setOnInsert": payload},
+                    upsert=True,
+                )
+            except (PyMongoError, OSError, TimeoutError) as exc:
+                self._last_error = exc
+                self._mongo_healthy = False
+                print(f"[Voroa] Local-to-Mongo sync paused: {type(exc).__name__}: {exc}", flush=True)
+                return
+
     async def ping(self) -> bool:
         if not self.configured:
             self._mongo_healthy = False
@@ -91,13 +115,14 @@ class SessionStore:
                 await self._client.admin.command("ping")
                 self._last_error = None
                 self._mongo_healthy = True
+                await self._sync_local_to_mongo()
                 print(f"[Voroa] MongoDB connected (attempt {attempt}).", flush=True)
-                return True
+                return self._mongo_healthy
             except Exception as exc:
                 self._last_error = exc
                 self._mongo_healthy = False
                 if attempt < 3:
-                    await __import__("asyncio").sleep(min(2 * attempt, 5))
+                    await asyncio.sleep(min(2 * attempt, 5))
                 else:
                     print(
                         f"[Voroa] MongoDB unavailable after {attempt} attempts; local mirror is active: "
