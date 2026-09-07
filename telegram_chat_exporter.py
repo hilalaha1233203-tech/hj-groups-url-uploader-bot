@@ -283,13 +283,23 @@ async def send_to_destination(message: Any, destination: str) -> Any:
         await user_client.download_media(message, file=str(temp_path))
         client = PlaybookClient(token=token, org_slug=org)
         asset_token = await client.upload_file(temp_path, title=name)
-        asset = await client.get_asset(asset_token)
+        asset = {}
+        for _ in range(30):
+            asset = await client.get_asset(asset_token)
+            if not asset.get("is_skeleton", False):
+                break
+            await asyncio.sleep(2)
         url = str(asset.get("display_url") or "").strip()
         if not url:
-            raise PlaybookError("Playbook asset has no display_url")
-        return await with_flood_wait(lambda: user_client.send_file(
+            raise PlaybookError(str(asset.get("source_error") or "Playbook asset has no display_url"))
+        sent = await with_flood_wait(lambda: user_client.send_file(
             destination, url, name=name, caption=caption_for(message)
         ))
+        try:
+            await client.delete_asset(asset_token)
+        except Exception as exc:
+            print(f"Playbook cleanup failed: {type(exc).__name__}: {exc}")
+        return sent
     finally:
         try:
             temp_path.unlink(missing_ok=True)
