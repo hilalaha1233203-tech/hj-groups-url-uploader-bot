@@ -12,4 +12,4 @@ RUN python -m pip install --upgrade pip && \
 
 COPY . .
 
-CMD ["python", "start.py"]
+CMD ["python", "voroa_launcher.py"]

@@ -63,7 +63,7 @@ python voroa_stable_test.py
 python smoke_test.py
 ```
 
-The CI workflow compiles and imports only the current Voroa production files. The previous VJ URL uploader runtime, plugins, database, Playbook client, and legacy entrypoints are intentionally not part of the repository anymore.
+The CI workflow compiles and imports only the current Voroa production files; the old VJ URL uploader runtime is intentionally not part of the production path.
 
 ## Telegram access
 
