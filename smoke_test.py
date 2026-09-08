@@ -8,8 +8,10 @@ BOT = (ROOT / "telegram_bot.py").read_text(encoding="utf-8")
 STORE = (ROOT / "telegram_session_store.py").read_text(encoding="utf-8")
 PLAYBOOK = (ROOT / "playbook_client.py").read_text(encoding="utf-8")
 START = (ROOT / "start.py").read_text(encoding="utf-8")
+START_V2 = (ROOT / "start_v2.py").read_text(encoding="utf-8")
+PROCFILE = (ROOT / "Procfile").read_text(encoding="utf-8")
 
-for path in ("telegram_bot.py", "telegram_session_store.py", "playbook_client.py", "start.py"):
+for path in ("telegram_bot.py", "telegram_session_store.py", "playbook_client.py", "start.py", "start_v2.py", "smoke_test.py"):
     compile((ROOT / path).read_text(encoding="utf-8"), path, "exec")
 
 module = ast.parse(BOT)
@@ -95,7 +97,7 @@ assert "x-amz-meta-extension" in PLAYBOOK
 assert "x-amz-meta-encrypted-organization-metadata" in PLAYBOOK
 assert "class ProgressFileStream(httpx.AsyncByteStream)" in PLAYBOOK
 
-# Voroa entrypoint hardening: persisted session fallback and private-peer access-hash cache.
+# Legacy entrypoint hardening: persisted session fallback and private-peer access-hash cache.
 assert "original_saved_session = app[\"saved_session\"]" in START
 assert "async def _durable_saved_session()" in START
 assert "session_store._local_get(\"primary\")" in START
@@ -108,4 +110,14 @@ assert "Resolved {peer} from persistent Telegram peer cache." in START
 assert "app[\"saved_session\"] = _durable_saved_session" in START
 assert "app[\"resolve_message_peer\"] = patched_resolve_message_peer" in START
 
-print("Voroa smoke checks: PASS (syntax + parsers + range + filenames + access + single-owner + command scoping + persistence recovery + Playbook contract + durable session + private-peer recovery)")
+# Hardened Voroa entrypoint regression guards.
+assert "Message.edit_text = _safe_edit_text" in START_V2
+assert "isinstance(kwargs.get(\"reply_markup\"), ReplyKeyboardMarkup)" in START_V2
+assert "kwargs.pop(\"reply_markup\", None)" in START_V2
+assert "dp.errors.register(error_handler)" in START_V2
+assert "delete_webhook(drop_pending_updates=False)" in START_V2
+assert "Bot API connection OK" in START_V2
+assert "FATAL WORKER ERROR" in START_V2
+assert "worker: python3 start_v2.py" in PROCFILE
+
+print("Voroa smoke checks: PASS (syntax + parsers + range + filenames + access + single-owner + command scoping + persistence recovery + Playbook contract + durable session + private-peer recovery + aiogram markup guard + hardened worker entrypoint)")
