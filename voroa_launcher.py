@@ -5,8 +5,6 @@ import asyncio
 import os
 
 from aiogram.exceptions import TelegramConflictError, TelegramNetworkError
-from telethon import TelegramClient
-from telethon.sessions import StringSession
 
 import voroa_stable as v
 
@@ -19,7 +17,8 @@ PORT = int(os.getenv("PORT", "10000"))
 async def health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
         request = await asyncio.wait_for(reader.read(2048), timeout=5)
-        parts = (request.split(b"\r\n", 1)[0] if request else b"").split(b" ", 2)
+        first_line = request.split(b"\r\n", 1)[0] if request else b""
+        parts = first_line.split(b" ", 2)
         path = parts[1].decode("ascii", "ignore") if len(parts) >= 2 else "/"
         if path == "/healthz":
             body = b'{"status":"ok","service":"voroa"}\n'
@@ -27,7 +26,6 @@ async def health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         else:
             body = b"Voroa is running.\n"
             content_type = b"text/plain; charset=utf-8"
-
         response = (
             b"HTTP/1.1 200 OK\r\n"
             b"Content-Type: " + content_type + b"\r\n"
@@ -56,13 +54,7 @@ async def start_health_server() -> asyncio.AbstractServer:
 async def prepare() -> None:
     session = v.load_session_string()
     if session and session != v.SESSION_STRING:
-        old = v.user_client
-        try:
-            if old.is_connected():
-                await old.disconnect()
-        except Exception:
-            pass
-        v.user_client = TelegramClient(StringSession(session), v.API_ID, v.API_HASH)
+        await v.rebuild_user_client(session)
 
     me = await v.bot.get_me()
     print(f"[Voroa] Bot API OK: @{getattr(me, 'username', 'unknown')}", flush=True)
@@ -94,8 +86,7 @@ async def run() -> None:
                 except TelegramConflictError as exc:
                     restarts += 1
                     print(
-                        f"[Voroa] POLLING CONFLICT #{restarts}: {exc}. "
-                        "Only one process may poll this bot token.",
+                        f"[Voroa] POLLING CONFLICT #{restarts}: {exc}. Only one process may poll this bot token.",
                         flush=True,
                     )
                     if restarts >= MAX_RESTARTS:
