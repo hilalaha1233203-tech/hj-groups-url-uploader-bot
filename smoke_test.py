@@ -5,6 +5,7 @@ import os
 os.environ.setdefault("TELEGRAM_API_ID", "12345")
 os.environ.setdefault("TELEGRAM_API_HASH", "ci_test_hash")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123456:ci_test_token")
+os.environ.setdefault("VOROA_OWNER_USER_ID", "456")
 
 import voroa_stable as v
 
@@ -52,10 +53,10 @@ def test_authorization() -> None:
 
 
 def test_confirm_ui_contract() -> None:
-    keyboard = v.confirm_keyboard(123)
+    keyboard = v.confirm_keyboard("abc123")
     callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
-    assert "confirm:123" in callbacks
-    assert "job_cancel:123" in callbacks
+    assert "confirm:abc123" in callbacks
+    assert "job_cancel:abc123" in callbacks
 
 
 def test_cancel_ui_contract() -> None:
