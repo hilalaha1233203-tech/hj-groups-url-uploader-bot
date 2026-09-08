@@ -12,8 +12,6 @@ import os
 
 from aiogram.exceptions import TelegramNetworkError
 
-import voroa_stable as v
-
 STARTUP_RETRY_LIMIT = max(1, int(os.getenv("VOROA_STARTUP_RETRY_LIMIT", "12") or 12))
 RESTART_DELAY = max(2, int(os.getenv("VOROA_RESTART_DELAY_SECONDS", "5") or 5))
 ENABLE_HEALTH_SERVER = os.getenv("VOROA_ENABLE_HEALTH_SERVER", "0").strip().lower() in {
@@ -63,9 +61,18 @@ async def start_health_server() -> asyncio.AbstractServer | None:
     return server
 
 
-async def prepare() -> None:
+async def load_runtime():
+    # Import only after sanitising the env session.  Telethon constructs its
+    # StringSession during module import, so a malformed/stale env session
+    # must never prevent the launcher from starting and loading /data state.
+    os.environ["TELEGRAM_SESSION_STRING"] = ""
+    import voroa_stable as v
+    return v
+
+
+async def prepare(v) -> None:
     session = v.load_session_string()
-    if session and session != v.SESSION_STRING:
+    if session:
         await v.rebuild_user_client(session)
 
     me = await v.bot.get_me()
@@ -76,12 +83,13 @@ async def prepare() -> None:
         await v.bot.delete_webhook(drop_pending_updates=False)
 
 
-async def startup_once() -> None:
-    await prepare()
+async def startup_once(v) -> None:
+    await prepare(v)
     await v.on_startup()
 
 
 async def run() -> None:
+    v = await load_runtime()
     health_server = await start_health_server()
     try:
         startup_attempt = 0
@@ -89,7 +97,7 @@ async def run() -> None:
             try:
                 startup_attempt += 1
                 print(f"[Voroa] Startup attempt #{startup_attempt}", flush=True)
-                await startup_once()
+                await startup_once(v)
                 print("[Voroa] Startup checks passed.", flush=True)
                 break
             except asyncio.CancelledError:
