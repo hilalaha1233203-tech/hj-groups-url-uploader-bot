@@ -6,7 +6,6 @@ import os
 import runpy
 import time
 
-from aiogram.filters import Command
 from aiogram.types import ErrorEvent, Message, ReplyKeyboardMarkup
 from telethon.tl.types import InputPeerChannel, InputPeerChat, InputPeerUser
 
@@ -257,32 +256,6 @@ async def patched_resolve_message_peer(peer):
 
 app["saved_session"] = durable_saved_session
 app["resolve_message_peer"] = patched_resolve_message_peer
-
-
-async def status_command(message: Message):
-    uid = message.from_user.id if message.from_user else 0
-    if not app["allowed"](uid):
-        await message.answer("⛔ You are not authorized to use this bot.")
-        return
-    mongo = "✅ Connected" if session_store.healthy else "⚠️ Local fallback"
-    try:
-        session = await app["saved_session"]()
-        telegram = "✅ Session saved" if session else "⚠️ No account session — use 🔐 Login"
-    except Exception:
-        telegram = "⚠️ Session check unavailable"
-    dest = app["destination"](uid) or "⚠️ Not set"
-    await message.answer(
-        "🩺 HJ GROUPS Bot Status\n\n"
-        f"🤖 Bot: ✅ Online\n"
-        f"🗄️ Storage: {mongo}\n"
-        f"📱 Telegram account: {telegram}\n"
-        f"🎯 Destination: {dest}\n\n"
-        "Use the buttons below to continue.",
-        reply_markup=menu_fn(),
-    )
-
-
-app["dp"].message.register(status_command, Command("status"))
 
 
 async def run():
