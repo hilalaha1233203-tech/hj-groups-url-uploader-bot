@@ -97,7 +97,6 @@ assert "x-amz-meta-extension" in PLAYBOOK
 assert "x-amz-meta-encrypted-organization-metadata" in PLAYBOOK
 assert "class ProgressFileStream(httpx.AsyncByteStream)" in PLAYBOOK
 
-# Legacy entrypoint hardening: persisted session fallback and private-peer access-hash cache.
 assert "original_saved_session = app[\"saved_session\"]" in START
 assert "async def _durable_saved_session()" in START
 assert "session_store._local_get(\"primary\")" in START
@@ -110,7 +109,6 @@ assert "Resolved {peer} from persistent Telegram peer cache." in START
 assert "app[\"saved_session\"] = _durable_saved_session" in START
 assert "app[\"resolve_message_peer\"] = patched_resolve_message_peer" in START
 
-# Hardened Voroa entrypoint regression guards.
 assert "Message.edit_text = _safe_edit_text" in START_V2
 assert "isinstance(kwargs.get(\"reply_markup\"), ReplyKeyboardMarkup)" in START_V2
 assert "kwargs.pop(\"reply_markup\", None)" in START_V2
@@ -118,6 +116,14 @@ assert "dp.errors.register(error_handler)" in START_V2
 assert "delete_webhook(drop_pending_updates=False)" in START_V2
 assert "Bot API connection OK" in START_V2
 assert "FATAL WORKER ERROR" in START_V2
+assert "BUILD_TAG" in START_V2
+assert "ACTIVE_TRANSFER_TASKS" in START_V2
+assert "async def patched_confirm(callback)" in START_V2
+assert "asyncio.create_task(_run_transfer(job, callback.message, uid)" in START_V2
+assert "Transfer started" in START_V2
+assert "transfer_cancel:" in START_V2
+assert "async def transfer_cancel_callback(callback)" in START_V2
+assert "task.cancel()" in START_V2
 assert "worker: python3 start_v2.py" in PROCFILE
 
-print("Voroa smoke checks: PASS (syntax + parsers + range + filenames + access + single-owner + command scoping + persistence recovery + Playbook contract + durable session + private-peer recovery + aiogram markup guard + hardened worker entrypoint)")
+print("Voroa smoke checks: PASS (syntax + parsers + range + filenames + access + single-owner + command scoping + persistence recovery + Playbook contract + durable session + private-peer recovery + aiogram markup guard + hardened worker + reliable confirm/progress/cancel flow)")
