@@ -19,7 +19,7 @@ jobs:
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
 
       - name: Compile production and legacy Python files
-        run: python -m py_compile voroa_stable.py voroa_stable_test.py start.py start_v2.py telegram_bot.py telegram_session_store.py playbook_client.py smoke_test.py
+        run: python -m py_compile voroa_stable.py voroa_launcher.py voroa_stable_test.py start.py start_v2.py telegram_bot.py telegram_session_store.py playbook_client.py smoke_test.py
 
       - name: Run stable core tests
         env:
@@ -33,7 +33,7 @@ jobs:
           TELEGRAM_API_ID: '12345'
           TELEGRAM_API_HASH: 'ci_entrypoint_test_hash'
           TELEGRAM_BOT_TOKEN: '123456:ci_entrypoint_test_token'
-        run: python -c "import voroa_stable; print('Voroa stable import OK')"
+        run: python -c "import voroa_stable; import voroa_launcher; print('Voroa stable + launcher import OK')"
 
       - name: Load Voroa legacy entrypoint
         env:
