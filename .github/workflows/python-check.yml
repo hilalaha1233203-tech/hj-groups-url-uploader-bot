@@ -19,7 +19,14 @@ jobs:
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
 
       - name: Compile production and legacy Python files
-        run: python -m py_compile voroa_stable.py start.py start_v2.py telegram_bot.py telegram_session_store.py playbook_client.py smoke_test.py
+        run: python -m py_compile voroa_stable.py voroa_stable_test.py start.py start_v2.py telegram_bot.py telegram_session_store.py playbook_client.py smoke_test.py
+
+      - name: Run stable core tests
+        env:
+          TELEGRAM_API_ID: '12345'
+          TELEGRAM_API_HASH: 'ci_entrypoint_test_hash'
+          TELEGRAM_BOT_TOKEN: '123456:ci_entrypoint_test_token'
+        run: python voroa_stable_test.py
 
       - name: Import production entrypoint without starting polling
         env:
@@ -43,5 +50,5 @@ jobs:
           TELEGRAM_ALLOWED_USER_IDS: '123456789'
         run: python -c "import runpy; runpy.run_path('start_v2.py', run_name='voroa_entrypoint_test')"
 
-      - name: Run deterministic smoke regression
+      - name: Run deterministic legacy smoke regression
         run: python smoke_test.py
