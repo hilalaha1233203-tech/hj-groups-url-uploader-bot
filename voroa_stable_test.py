@@ -217,6 +217,7 @@ async def test_cancel_during_floodwait_does_not_retry():
     original_resolve = v.resolve_peer
     original_refresh = v.refresh_message
     original_transfer = v.transfer_one
+    original_flood = v.FloodWaitError
     calls = {"transfer": 0}
 
     async def fake_resolve(destination):
@@ -225,32 +226,30 @@ async def test_cancel_during_floodwait_does_not_retry():
     async def fake_refresh(job_arg, message_id):
         return selected
 
-    async def fake_transfer(message_arg, destination_arg, ctx_arg, index, total):
+    class FakeFloodWait(Exception):
+        seconds = 2
+
+    async def fake_transfer(*args, **kwargs):
         calls["transfer"] += 1
         if calls["transfer"] == 1:
-            raise v.FloodWaitError(request=None, capture=None)
+            raise FakeFloodWait()
 
     v.resolve_peer = fake_resolve
     v.refresh_message = fake_refresh
     v.transfer_one = fake_transfer
+    v.FloodWaitError = FakeFloodWait
     try:
-        # Simpler deterministic FloodWait stub with a seconds attribute.
-        class FakeFloodWait(Exception):
-            seconds = 2
-
-        original_flood = v.FloodWaitError
-        v.FloodWaitError = FakeFloodWait
         task = asyncio.create_task(v.run_transfer(job, ctx, uid))
         v.ACTIVE_TRANSFERS[uid] = task
         await asyncio.sleep(0.05)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         assert calls["transfer"] == 1
-        v.FloodWaitError = original_flood
     finally:
         v.resolve_peer = original_resolve
         v.refresh_message = original_refresh
         v.transfer_one = original_transfer
+        v.FloodWaitError = original_flood
         reset_state()
 
 
