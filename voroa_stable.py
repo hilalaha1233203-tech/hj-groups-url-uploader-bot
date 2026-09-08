@@ -1,0 +1,950 @@
+"""Voroa Stable Telegram media transfer bot.
+
+Clean runtime entrypoint for the HJ GROUPS media transfer project.
+Uses aiogram for the bot UI and Telethon for the user-session Telegram API.
+No monkey-patching, no nested runpy entrypoints, and no MongoDB dependency.
+"""
+from __future__ import annotations
+
+import asyncio
+import html
+import json
+import os
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
+from telethon import TelegramClient, utils
+from telethon.errors import (
+    AuthKeyInvalidError,
+    AuthKeyUnregisteredError,
+    FloodWaitError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    RPCError,
+    SessionPasswordNeededError,
+    SessionRevokedError,
+)
+from telethon.sessions import StringSession
+from telethon.tl.types import InputPeerChannel, InputPeerChat, InputPeerUser
+
+
+BUILD_TAG = "voroa-stable-2026-09-08"
+
+API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or 0)
+API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING", "").strip()
+SESSION_FILE = Path(os.getenv("VOROA_SESSION_FILE", "/data/voroa_session.txt"))
+STATE_FILE = Path(os.getenv("VOROA_STATE_FILE", "/data/voroa_state.json"))
+DEFAULT_DESTINATION = os.getenv("TELEGRAM_DESTINATION", "").strip()
+OWNER_ID = int(os.getenv("VOROA_OWNER_USER_ID", "0") or 0)
+ALLOWED_IDS = {
+    int(v.strip())
+    for v in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").split(",")
+    if v.strip().isdigit() and int(v.strip()) > 0
+}
+MAX_BULK_MESSAGES = max(1, int(os.getenv("TELEGRAM_MAX_BULK_MESSAGES", "500") or 500))
+MAX_TRANSFER_FILES = max(1, int(os.getenv("VOROA_MAX_TRANSFER_FILES", "100") or 100))
+SCAN_TIMEOUT = max(10, int(os.getenv("TELEGRAM_SCAN_TIMEOUT_SECONDS", "30") or 30))
+
+if not API_ID or not API_HASH or not BOT_TOKEN:
+    raise RuntimeError("Missing TELEGRAM_API_ID, TELEGRAM_API_HASH, or TELEGRAM_BOT_TOKEN.")
+
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+
+PENDING_INPUT: dict[int, str] = {}
+JOBS: dict[int, "Job"] = {}
+DESTINATIONS: dict[int, str] = {}
+ACTIVE_TRANSFERS: dict[int, asyncio.Task] = {}
+LOGIN_DATA: dict[int, dict[str, str]] = {}
+STATE_LOCK = asyncio.Lock()
+CLIENT_LOCK = asyncio.Lock()
+
+
+@dataclass
+class Job:
+    owner_id: int
+    source: Any
+    messages: list[Any]
+    destination: str
+    selected: list[Any]
+
+
+def menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔗 Scan Link"), KeyboardButton(text="📦 Bulk Range")],
+            [KeyboardButton(text="🎯 Destination"), KeyboardButton(text="📋 Current Job")],
+            [KeyboardButton(text="🔐 Login"), KeyboardButton(text="📱 Session")],
+            [KeyboardButton(text="🚪 Logout"), KeyboardButton(text="❌ Cancel")],
+            [KeyboardButton(text="ℹ️ Help")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Choose a function…",
+    )
+
+
+def inline_cancel(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🛑 Cancel Transfer", callback_data=f"transfer_cancel:{uid}")]]
+    )
+
+
+def confirm_keyboard(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Confirm Transfer", callback_data=f"confirm:{uid}")],
+            [InlineKeyboardButton(text="❌ Cancel", callback_data=f"job_cancel:{uid}")],
+        ]
+    )
+
+
+def kind(message: Any) -> str:
+    media = getattr(message, "media", None)
+    if media is None:
+        return "text"
+    name = type(media).__name__
+    if name == "MessageMediaPhoto":
+        return "photo"
+    document = getattr(media, "document", None)
+    if document is None:
+        return "media"
+    mime = (getattr(document, "mime_type", "") or "").lower()
+    attrs = {type(a).__name__ for a in (getattr(document, "attributes", []) or [])}
+    if "DocumentAttributeVideo" in attrs or mime.startswith("video/"):
+        return "video"
+    if "DocumentAttributeAudio" in attrs or mime.startswith("audio/"):
+        return "audio"
+    if mime.startswith("image/"):
+        return "photo"
+    return "document"
+
+
+def file_size(message: Any) -> int:
+    document = getattr(getattr(message, "media", None), "document", None)
+    return int(getattr(document, "size", 0) or 0)
+
+
+def human_size(value: int) -> str:
+    if not value:
+        return "Unknown"
+    size = float(value)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return "Unknown"
+
+
+def filename(message: Any) -> str:
+    name = getattr(getattr(message, "file", None), "name", None) or f"telegram-{getattr(message, 'id', 'media')}"
+    name = re.sub(r"[\\/:*?\"<>|\x00\r\n]+", "_", str(name)).strip(" .")
+    return name[:200] or f"telegram-{getattr(message, 'id', 'media')}"
+
+
+def clean_caption(message: Any) -> str:
+    caption = (getattr(message, "message", None) or "").strip()
+    extra = f"📦 File Size: {human_size(file_size(message))}"
+    return (f"{caption}\n\n{extra}" if caption else extra)[:1024]
+
+
+def authorized(uid: Optional[int]) -> bool:
+    if not uid:
+        return False
+    if not ALLOWED_IDS:
+        return True
+    return int(uid) in ALLOWED_IDS or (OWNER_ID and int(uid) == OWNER_ID)
+
+
+def read_state() -> dict[str, Any]:
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def write_state(data: dict[str, Any]) -> None:
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+        temp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        temp.replace(STATE_FILE)
+    except OSError as exc:
+        print(f"[Voroa] State write failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+STATE = read_state()
+for key, value in STATE.get("destinations", {}).items():
+    try:
+        DESTINATIONS[int(key)] = str(value)
+    except (TypeError, ValueError):
+        continue
+
+
+def get_destination(uid: int) -> str:
+    return (DESTINATIONS.get(uid) or DEFAULT_DESTINATION).strip()
+
+
+async def set_destination(uid: int, destination: str) -> str:
+    value = destination.strip()
+    if not value:
+        raise ValueError("Destination cannot be empty.")
+    async with STATE_LOCK:
+        DESTINATIONS[uid] = value
+        STATE.setdefault("destinations", {})[str(uid)] = value
+        write_state(STATE)
+    return value
+
+
+def save_session_string(value: str) -> None:
+    if not value:
+        raise ValueError("Empty Telegram session.")
+    SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp = SESSION_FILE.with_suffix(SESSION_FILE.suffix + ".tmp")
+    temp.write_text(value.strip(), encoding="utf-8")
+    temp.replace(SESSION_FILE)
+
+
+def load_session_string() -> str:
+    if SESSION_STRING:
+        return SESSION_STRING
+    try:
+        value = SESSION_FILE.read_text(encoding="utf-8").strip()
+        return value
+    except OSError:
+        return ""
+
+
+async def answer_safe(message: Message, text: str, **kwargs: Any) -> Message:
+    try:
+        return await message.answer(text, **kwargs)
+    except TelegramNetworkError as exc:
+        print(f"[Voroa] Telegram send failed: {type(exc).__name__}: {exc}", flush=True)
+        raise
+
+
+async def edit_safe(message: Message, text: str, **kwargs: Any) -> Optional[Message]:
+    try:
+        return await message.edit_text(text, **kwargs)
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return message
+        print(f"[Voroa] Status edit rejected: {exc}", flush=True)
+        return None
+    except TelegramNetworkError as exc:
+        print(f"[Voroa] Status edit network error: {exc}", flush=True)
+        return None
+    except Exception as exc:
+        print(f"[Voroa] Status edit error: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+async def ensure_user_client() -> None:
+    session = load_session_string()
+    if not session:
+        raise RuntimeError("No Telegram user session. Use 🔐 Login first or set TELEGRAM_SESSION_STRING.")
+    async with CLIENT_LOCK:
+        if not user_client.is_connected():
+            await asyncio.wait_for(user_client.connect(), timeout=SCAN_TIMEOUT)
+        try:
+            authorized_now = await asyncio.wait_for(user_client.is_user_authorized(), timeout=SCAN_TIMEOUT)
+        except (AuthKeyInvalidError, AuthKeyUnregisteredError, SessionRevokedError) as exc:
+            raise RuntimeError("The saved Telegram session is invalid or revoked. Login again.") from exc
+        if not authorized_now:
+            raise RuntimeError("The saved Telegram session is no longer authorized. Login again.")
+
+
+async def rebuild_user_client(session: str) -> None:
+    global user_client
+    async with CLIENT_LOCK:
+        if user_client.is_connected():
+            await user_client.disconnect()
+        user_client = TelegramClient(StringSession(session), API_ID, API_HASH)
+        await asyncio.wait_for(user_client.connect(), timeout=SCAN_TIMEOUT)
+
+
+async def resolve_peer(value: str) -> Any:
+    value = value.strip()
+    await ensure_user_client()
+    try:
+        return await asyncio.wait_for(user_client.get_input_entity(value), timeout=SCAN_TIMEOUT)
+    except (ValueError, TypeError, KeyError):
+        if not value.lstrip("-").isdigit():
+            return await asyncio.wait_for(user_client.get_entity(value), timeout=SCAN_TIMEOUT)
+        target_id = int(value)
+        raw_id, peer_type = utils.resolve_id(target_id)
+        if peer_type is InputPeerChannel:
+            try:
+                return await asyncio.wait_for(user_client.get_input_entity(InputPeerChannel(raw_id, 0)), timeout=SCAN_TIMEOUT)
+            except Exception:
+                pass
+        async def search_dialogs() -> Any:
+            async for dialog in user_client.iter_dialogs():
+                entity = getattr(dialog, "entity", None)
+                if entity is None:
+                    continue
+                try:
+                    if utils.get_peer_id(entity, add_mark=True) == target_id:
+                        return entity
+                except Exception:
+                    continue
+            return None
+        entity = await asyncio.wait_for(search_dialogs(), timeout=SCAN_TIMEOUT * 2)
+        if entity is None:
+            raise RuntimeError(
+                f"Telegram chat {value} is not accessible. The logged-in account must be a member of that chat/channel."
+            )
+        return entity
+
+
+def parse_single_link(value: str) -> tuple[str, int]:
+    match = re.fullmatch(
+        r"https?://(?:www\.)?t\.me/(?:c/(\d+)|([A-Za-z0-9_]{3,}))/([0-9]+)(?:\?.*)?",
+        value.strip(),
+    )
+    if not match:
+        raise ValueError("Use a Telegram message link like https://t.me/c/123456789/42")
+    private_id, username, mid = match.groups()
+    peer = f"-100{private_id}" if private_id else f"@{username}"
+    return peer, int(mid)
+
+
+def parse_range(value: str) -> tuple[str, int, int]:
+    match = re.fullmatch(
+        r"https?://(?:www\.)?t\.me/(?:c/(\d+)|([A-Za-z0-9_]{3,}))/(\d+)\s*(?:-|to|\s)\s*(\d+)(?:\?.*)?",
+        value.strip(),
+        re.IGNORECASE,
+    )
+    if not match:
+        raise ValueError("Use a range like https://t.me/c/123456789/100-110")
+    private_id, username, start_text, end_text = match.groups()
+    start_id, end_id = int(start_text), int(end_text)
+    if start_id <= 0 or end_id < start_id:
+        raise ValueError("Invalid message range.")
+    if end_id - start_id + 1 > MAX_BULK_MESSAGES:
+        raise ValueError(f"Maximum range is {MAX_BULK_MESSAGES} messages.")
+    peer = f"-100{private_id}" if private_id else f"@{username}"
+    return peer, start_id, end_id
+
+
+async def get_messages_for_range(entity: Any, start_id: int, end_id: int) -> list[Any]:
+    found: dict[int, Any] = {}
+    for pos in range(start_id, end_id + 1, 100):
+        ids = list(range(pos, min(end_id + 1, pos + 100)))
+        rows = await user_client.get_messages(entity, ids=ids)
+        if not isinstance(rows, list):
+            rows = [rows]
+        for message in rows:
+            if message is not None:
+                found[int(message.id)] = message
+    return [found[mid] for mid in range(start_id, end_id + 1) if mid in found]
+
+
+async def scan_source(peer: str, message_ids: list[int]) -> tuple[Any, list[Any]]:
+    entity = await resolve_peer(peer)
+    rows = await user_client.get_messages(entity, ids=message_ids)
+    if not isinstance(rows, list):
+        rows = [rows]
+    mapping = {int(m.id): m for m in rows if m is not None}
+    return entity, [mapping[mid] for mid in message_ids if mid in mapping]
+
+
+async def heartbeat(status: Message, uid: int, current: str, started: float, stop: asyncio.Event) -> None:
+    pulse = 0
+    while not stop.is_set():
+        pulse += 1
+        elapsed = int(time.monotonic() - started)
+        dots = "." * ((pulse % 3) + 1)
+        await edit_safe(
+            status,
+            f"📄 <b>{html.escape(current)}</b>\n\n📤 Sending through Telegram{dots}\n⏱ Elapsed: <b>{elapsed}s</b>",
+            parse_mode="HTML",
+            reply_markup=inline_cancel(uid),
+        )
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def progress_callback_factory(status: Message, uid: int, current_name: str, started: float):
+    state = {"last": 0.0, "task": None}
+
+    def callback(current: int, total: int) -> None:
+        now = time.monotonic()
+        if total <= 0 or now - state["last"] < 1.0:
+            return
+        state["last"] = now
+        percent = max(0, min(100, int((current / total) * 100)))
+        filled = percent // 10
+        elapsed = int(now - started)
+        text = (
+            f"📄 <b>{html.escape(current_name)}</b>\n\n"
+            f"[{percent:3d}%] {'█' * filled}{'░' * (10 - filled)}\n"
+            f"⏱ Elapsed: <b>{elapsed}s</b>"
+        )
+        previous = state.get("task")
+        if previous is not None and not previous.done():
+            previous.cancel()
+        state["task"] = asyncio.create_task(
+            edit_safe(status, text, parse_mode="HTML", reply_markup=inline_cancel(uid))
+        )
+
+    return callback, state
+
+
+async def transfer_one(message: Any, destination: Any, status: Message, uid: int, index: int, total: int) -> None:
+    name = filename(message)
+    started = time.monotonic()
+    stop = asyncio.Event()
+    beat = asyncio.create_task(heartbeat(status, uid, name, started, stop))
+    try:
+        await edit_safe(
+            status,
+            f"📄 <b>{html.escape(name)}</b>\n\n"
+            f"📦 File {index}/{total}\n"
+            f"💾 Size: <b>{human_size(file_size(message))}</b>\n\n"
+            "📤 Preparing Telegram transfer…",
+            parse_mode="HTML",
+            reply_markup=inline_cancel(uid),
+        )
+        progress, progress_state = await progress_callback_factory(status, uid, name, started)
+        await user_client.send_file(
+            destination,
+            message.media,
+            caption=clean_caption(message),
+            force_document=(kind(message) == "document"),
+            supports_streaming=True,
+            progress_callback=progress,
+        )
+        pending = progress_state.get("task")
+        if pending is not None and not pending.done():
+            pending.cancel()
+        await edit_safe(
+            status,
+            f"✅ <b>{html.escape(name)}</b>\n\n"
+            f"Completed {index}/{total} • {human_size(file_size(message))}",
+            parse_mode="HTML",
+            reply_markup=inline_cancel(uid) if index < total else None,
+        )
+    finally:
+        stop.set()
+        beat.cancel()
+        await asyncio.gather(beat, return_exceptions=True)
+
+
+async def run_transfer(job: Job, status: Message, uid: int) -> None:
+    start_all = time.monotonic()
+    done = 0
+    failed: list[str] = []
+    destination = await resolve_peer(job.destination)
+    total = len(job.selected)
+    for index, message in enumerate(job.selected, 1):
+        current_task = asyncio.current_task()
+        if current_task is not ACTIVE_TRANSFERS.get(uid):
+            raise asyncio.CancelledError
+        try:
+            await transfer_one(message, destination, status, uid, index, total)
+            done += 1
+        except FloodWaitError as exc:
+            wait_for = int(getattr(exc, "seconds", 1)) + 1
+            await edit_safe(
+                status,
+                f"⏳ Telegram rate limit\n\nWaiting <b>{wait_for}s</b> before continuing…",
+                parse_mode="HTML",
+                reply_markup=inline_cancel(uid),
+            )
+            await asyncio.sleep(wait_for)
+            await transfer_one(message, destination, status, uid, index, total)
+            done += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failed.append(f"#{getattr(message, 'id', '?')} {type(exc).__name__}: {exc}")
+            print(f"[Voroa] Transfer item failed: {type(exc).__name__}: {exc}", flush=True)
+            await edit_safe(
+                status,
+                f"⚠️ <b>Skipped #{getattr(message, 'id', '?')}</b>\n\n<code>{html.escape(str(exc))}</code>",
+                parse_mode="HTML",
+                reply_markup=inline_cancel(uid),
+            )
+    elapsed = int(time.monotonic() - start_all)
+    summary = [
+        "🎉 <b>Transfer finished</b>",
+        "",
+        f"✅ Completed: <b>{done}</b>",
+        f"❌ Failed: <b>{len(failed)}</b>",
+        f"⏱ Total time: <b>{elapsed}s</b>",
+        f"🎯 Destination: <code>{html.escape(job.destination)}</code>",
+    ]
+    if failed:
+        summary.extend(["", "<b>Failed items</b>", *[html.escape(item) for item in failed[:10]]])
+    await edit_safe(status, "\n".join(summary), parse_mode="HTML")
+
+
+async def finish_transfer(uid: int) -> None:
+    ACTIVE_TRANSFERS.pop(uid, None)
+    JOBS.pop(uid, None)
+
+
+async def start_transfer(uid: int, job: Job, anchor: Message) -> None:
+    if uid in ACTIVE_TRANSFERS and not ACTIVE_TRANSFERS[uid].done():
+        await anchor.answer("⚠️ A transfer is already running.")
+        return
+    status = await anchor.answer(
+        "🚀 <b>Transfer started</b>\n\n"
+        f"📦 Files: <b>{len(job.selected)}</b>\n"
+        f"🎯 Destination: <code>{html.escape(job.destination)}</code>\n\n"
+        "⏳ Preparing…",
+        parse_mode="HTML",
+        reply_markup=inline_cancel(uid),
+    )
+    task = asyncio.create_task(_transfer_wrapper(uid, job, status), name=f"voroa-transfer-{uid}")
+    ACTIVE_TRANSFERS[uid] = task
+
+
+async def _transfer_wrapper(uid: int, job: Job, status: Message) -> None:
+    try:
+        await run_transfer(job, status, uid)
+    except asyncio.CancelledError:
+        await edit_safe(
+            status,
+            "🛑 <b>Transfer cancelled</b>\n\nThe active transfer was stopped safely.",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        print(f"[Voroa] TRANSFER ERROR user={uid}: {type(exc).__name__}: {exc}", flush=True)
+        await edit_safe(
+            status,
+            f"❌ <b>Transfer failed</b>\n\n<code>{html.escape(type(exc).__name__ + ': ' + str(exc))}</code>",
+            parse_mode="HTML",
+        )
+    finally:
+        await finish_transfer(uid)
+
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message) -> None:
+    if not authorized(message.from_user.id if message.from_user else None):
+        await message.answer("⛔ You are not authorized to use this bot.")
+        return
+    await message.answer(
+        "<b>Voroa</b> 🚀\n\n"
+        "Telegram media transfer is ready.\n"
+        "Choose a function below.",
+        parse_mode="HTML",
+        reply_markup=menu(),
+    )
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await message.answer(
+        "<b>Voroa Help</b>\n\n"
+        "🔗 <b>Scan Link</b> — transfer one Telegram message\n"
+        "📦 <b>Bulk Range</b> — scan a message range\n"
+        "🎯 <b>Destination</b> — choose target chat/channel\n"
+        "📋 <b>Current Job</b> — show scanned files\n"
+        "🔐 <b>Login</b> — authenticate the Telegram user session\n"
+        "📱 <b>Session</b> — show session/account status\n"
+        "❌ <b>Cancel</b> — cancel current input/transfer\n\n"
+        "The bot uses your Telegram user session for source access and destination delivery.",
+        parse_mode="HTML",
+        reply_markup=menu(),
+    )
+
+
+@dp.message(F.text == "ℹ️ Help")
+async def button_help(message: Message) -> None:
+    await cmd_help(message)
+
+
+@dp.message(F.text == "🔗 Scan Link")
+async def button_scan(message: Message) -> None:
+    if not authorized(message.from_user.id):
+        return
+    PENDING_INPUT[message.from_user.id] = "single"
+    await message.answer("🔗 Send one Telegram message link.", reply_markup=menu())
+
+
+@dp.message(F.text == "📦 Bulk Range")
+async def button_bulk(message: Message) -> None:
+    if not authorized(message.from_user.id):
+        return
+    PENDING_INPUT[message.from_user.id] = "bulk"
+    await message.answer(
+        f"📦 Send a range link. Maximum: {MAX_BULK_MESSAGES} messages.\n\nExample:\nhttps://t.me/c/123456789/100-110",
+        reply_markup=menu(),
+    )
+
+
+@dp.message(F.text == "🎯 Destination")
+async def button_destination(message: Message) -> None:
+    if not authorized(message.from_user.id):
+        return
+    PENDING_INPUT[message.from_user.id] = "destination"
+    current = get_destination(message.from_user.id)
+    await message.answer(
+        f"🎯 Send destination chat/channel ID or @username.\n\nCurrent: <code>{html.escape(current or 'not set')}</code>",
+        parse_mode="HTML",
+        reply_markup=menu(),
+    )
+
+
+@dp.message(F.text == "📋 Current Job")
+async def button_job(message: Message) -> None:
+    if not authorized(message.from_user.id):
+        return
+    job = JOBS.get(message.from_user.id)
+    if not job:
+        await message.answer("📋 No active job. Scan a link first.", reply_markup=menu())
+        return
+    total = sum(file_size(m) for m in job.selected)
+    await message.answer(
+        f"📋 <b>Current job</b>\n\n"
+        f"Files: <b>{len(job.selected)}</b>\n"
+        f"Total: <b>{human_size(total)}</b>\n"
+        f"Destination: <code>{html.escape(job.destination)}</code>",
+        parse_mode="HTML",
+        reply_markup=confirm_keyboard(message.from_user.id),
+    )
+
+
+@dp.message(F.text == "🔐 Login")
+async def button_login(message: Message) -> None:
+    if not authorized(message.from_user.id):
+        return
+    PENDING_INPUT[message.from_user.id] = "phone"
+    await message.answer(
+        "🔐 Send your Telegram phone number in international format.\n\n"
+        "Never send your password or session string here unless this bot is your own private project.",
+        reply_markup=menu(),
+    )
+
+
+@dp.message(F.text == "📱 Session")
+async def button_session(message: Message) -> None:
+    if not authorized(message.from_user.id):
+        return
+    try:
+        await ensure_user_client()
+        me = await user_client.get_me()
+        name = " ".join(x for x in [getattr(me, "first_name", ""), getattr(me, "last_name", "")] if x).strip()
+        await message.answer(
+            "📱 <b>Session active</b>\n\n"
+            f"Account: <b>{html.escape(name or 'Unknown')}</b>\n"
+            f"User ID: <code>{me.id}</code>",
+            parse_mode="HTML",
+            reply_markup=menu(),
+        )
+    except Exception as exc:
+        await message.answer(
+            f"⚠️ <b>Session unavailable</b>\n\n<code>{html.escape(str(exc))}</code>",
+            parse_mode="HTML",
+            reply_markup=menu(),
+        )
+
+
+@dp.message(F.text == "🚪 Logout")
+async def button_logout(message: Message) -> None:
+    if not authorized(message.from_user.id):
+        return
+    try:
+        await user_client.log_out()
+    except Exception:
+        pass
+    try:
+        if user_client.is_connected():
+            await user_client.disconnect()
+    except Exception:
+        pass
+    try:
+        SESSION_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+    LOGIN_DATA.pop(message.from_user.id, None)
+    await message.answer("🚪 Logged out. Login again when needed.", reply_markup=menu())
+
+
+@dp.message(F.text == "❌ Cancel")
+async def button_cancel(message: Message) -> None:
+    uid = message.from_user.id
+    if not authorized(uid):
+        return
+    PENDING_INPUT.pop(uid, None)
+    task = ACTIVE_TRANSFERS.get(uid)
+    if task is not None and not task.done():
+        task.cancel()
+        await message.answer("🛑 Transfer cancellation requested.", reply_markup=menu())
+        return
+    await message.answer("✅ Cancelled.", reply_markup=menu())
+
+
+@dp.callback_query(F.data.startswith("job_cancel:"))
+async def job_cancel(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id
+    if not authorized(uid):
+        await callback.answer("Not authorized", show_alert=True)
+        return
+    JOBS.pop(uid, None)
+    await callback.answer("Cancelled")
+    if callback.message:
+        await callback.message.answer("✅ Job cancelled.", reply_markup=menu())
+
+
+@dp.callback_query(F.data.startswith("confirm:"))
+async def confirm(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id
+    if not authorized(uid):
+        await callback.answer("Not authorized", show_alert=True)
+        return
+    job = JOBS.get(uid)
+    if not job or not job.selected:
+        await callback.answer("Job expired. Scan again.", show_alert=True)
+        return
+    if uid in ACTIVE_TRANSFERS and not ACTIVE_TRANSFERS[uid].done():
+        await callback.answer("A transfer is already running.", show_alert=True)
+        return
+    await callback.answer("🚀 Started")
+    await start_transfer(uid, job, callback.message)
+
+
+@dp.callback_query(F.data.startswith("transfer_cancel:"))
+async def transfer_cancel(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id
+    if not authorized(uid):
+        await callback.answer("Not authorized", show_alert=True)
+        return
+    task = ACTIVE_TRANSFERS.get(uid)
+    if task is None or task.done():
+        await callback.answer("No active transfer", show_alert=True)
+        return
+    task.cancel()
+    await callback.answer("🛑 Cancelling…")
+
+
+@dp.message()
+async def text_router(message: Message) -> None:
+    uid = message.from_user.id if message.from_user else 0
+    if not authorized(uid):
+        return
+    text = (message.text or "").strip()
+    if not text:
+        return
+    mode = PENDING_INPUT.get(uid)
+    if mode is None:
+        return
+    if mode == "single":
+        PENDING_INPUT.pop(uid, None)
+        try:
+            peer, mid = parse_single_link(text)
+            entity, rows = await scan_source(peer, [mid])
+            media = [m for m in rows if getattr(m, "media", None) is not None]
+            if not media:
+                raise RuntimeError("That message has no media file.")
+            destination = get_destination(uid)
+            if not destination:
+                raise RuntimeError("Set 🎯 Destination first.")
+            selected = media[:1]
+            job = Job(uid, entity, rows, destination, selected)
+            JOBS[uid] = job
+            total = file_size(selected[0])
+            await message.answer(
+                "🔎 <b>File found</b>\n\n"
+                f"📄 {html.escape(filename(selected[0]))}\n"
+                f"📦 Type: <b>{kind(selected[0])}</b>\n"
+                f"💾 Size: <b>{human_size(total)}</b>\n"
+                f"🎯 Destination: <code>{html.escape(destination)}</code>\n\n"
+                "Ready to transfer?",
+                parse_mode="HTML",
+                reply_markup=confirm_keyboard(uid),
+            )
+        except Exception as exc:
+            await message.answer(f"❌ {html.escape(str(exc))}", reply_markup=menu())
+        return
+    if mode == "bulk":
+        PENDING_INPUT.pop(uid, None)
+        try:
+            peer, start_id, end_id = parse_range(text)
+            await message.answer("🔎 Scanning messages…", reply_markup=menu())
+            entity = await resolve_peer(peer)
+            rows = await get_messages_for_range(entity, start_id, end_id)
+            media = [m for m in rows if getattr(m, "media", None) is not None]
+            if not media:
+                raise RuntimeError("No media messages were found in that range.")
+            if len(media) > MAX_TRANSFER_FILES:
+                media = media[:MAX_TRANSFER_FILES]
+            destination = get_destination(uid)
+            if not destination:
+                raise RuntimeError("Set 🎯 Destination first.")
+            job = Job(uid, entity, rows, destination, media)
+            JOBS[uid] = job
+            total_size = sum(file_size(m) for m in media)
+            await message.answer(
+                "🔎 <b>Bulk scan complete</b>\n\n"
+                f"📦 Media files: <b>{len(media)}</b>\n"
+                f"💾 Total size: <b>{human_size(total_size)}</b>\n"
+                f"🎯 Destination: <code>{html.escape(destination)}</code>\n\n"
+                "All detected media are selected by default.",
+                parse_mode="HTML",
+                reply_markup=confirm_keyboard(uid),
+            )
+        except Exception as exc:
+            await message.answer(f"❌ {html.escape(str(exc))}", reply_markup=menu())
+        return
+    if mode == "destination":
+        PENDING_INPUT.pop(uid, None)
+        try:
+            value = await set_destination(uid, text)
+            await message.answer(f"🎯 Destination saved: <code>{html.escape(value)}</code>", parse_mode="HTML", reply_markup=menu())
+        except Exception as exc:
+            await message.answer(f"❌ {html.escape(str(exc))}", reply_markup=menu())
+        return
+    if mode == "phone":
+        PENDING_INPUT.pop(uid, None)
+        await login_phone(message, text)
+        return
+    if mode == "code":
+        PENDING_INPUT.pop(uid, None)
+        await login_code(message, text)
+        return
+    if mode == "password":
+        PENDING_INPUT.pop(uid, None)
+        await login_password(message, text)
+
+
+async def login_phone(message: Message, phone: str) -> None:
+    uid = message.from_user.id
+    async with CLIENT_LOCK:
+        if user_client.is_connected():
+            await user_client.disconnect()
+        await user_client.connect()
+        try:
+            result = await user_client.send_code_request(phone)
+        except RPCError as exc:
+            await message.answer(f"❌ Telegram login failed: {html.escape(str(exc))}", reply_markup=menu())
+            return
+        LOGIN_DATA[uid] = {"phone": phone, "phone_code_hash": result.phone_code_hash}
+    PENDING_INPUT[uid] = "code"
+    await message.answer("📨 Telegram code sent. Send the code here.", reply_markup=menu())
+
+
+async def login_code(message: Message, code: str) -> None:
+    uid = message.from_user.id
+    data = LOGIN_DATA.get(uid)
+    if not data:
+        await message.answer("❌ Login session expired. Press 🔐 Login again.", reply_markup=menu())
+        return
+    try:
+        await user_client.sign_in(data["phone"], code=code, phone_code_hash=data["phone_code_hash"])
+    except SessionPasswordNeededError:
+        PENDING_INPUT[uid] = "password"
+        await message.answer("🔐 Two-step verification is enabled. Send your Telegram 2FA password.", reply_markup=menu())
+        return
+    except (PhoneCodeInvalidError, PhoneCodeExpiredError) as exc:
+        LOGIN_DATA.pop(uid, None)
+        await message.answer(f"❌ Invalid/expired code: {html.escape(str(exc))}", reply_markup=menu())
+        return
+    except Exception as exc:
+        LOGIN_DATA.pop(uid, None)
+        await message.answer(f"❌ Login failed: {html.escape(str(exc))}", reply_markup=menu())
+        return
+    await finalize_login(message)
+
+
+async def login_password(message: Message, password: str) -> None:
+    try:
+        await user_client.sign_in(password=password)
+    except Exception as exc:
+        await message.answer(f"❌ 2FA verification failed: {html.escape(str(exc))}", reply_markup=menu())
+        return
+    await finalize_login(message)
+
+
+async def finalize_login(message: Message) -> None:
+    uid = message.from_user.id
+    string = StringSession.save(user_client.session)
+    save_session_string(string)
+    LOGIN_DATA.pop(uid, None)
+    await message.answer(
+        "✅ <b>Telegram session saved</b>\n\n"
+        "Your Voroa session is ready. Set a destination and scan a link.",
+        parse_mode="HTML",
+        reply_markup=menu(),
+    )
+
+
+async def setup_commands() -> None:
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Open Voroa"),
+            BotCommand(command="help", description="Show help"),
+        ]
+    )
+
+
+async def on_startup() -> None:
+    print(f"[Voroa] Stable build: {BUILD_TAG}", flush=True)
+    for key in ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_BOT_TOKEN"):
+        print(f"[Voroa] {key}: {'set' if os.getenv(key) else 'MISSING'}", flush=True)
+    print(f"[Voroa] Session: {'set' if load_session_string() else 'missing'}", flush=True)
+    print(f"[Voroa] Destination: {'set' if DEFAULT_DESTINATION else 'per-user/interactive'}", flush=True)
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception as exc:
+        print(f"[Voroa] Webhook cleanup skipped: {type(exc).__name__}: {exc}", flush=True)
+    await setup_commands()
+    try:
+        if load_session_string():
+            await ensure_user_client()
+            me = await user_client.get_me()
+            print(f"[Voroa] Telegram user session OK: {getattr(me, 'id', 'unknown')}", flush=True)
+    except Exception as exc:
+        print(f"[Voroa] Telegram user session not ready: {type(exc).__name__}: {exc}", flush=True)
+    print("[Voroa] Bot polling is ready.", flush=True)
+
+
+async def on_shutdown() -> None:
+    for task in list(ACTIVE_TRANSFERS.values()):
+        if not task.done():
+            task.cancel()
+    if ACTIVE_TRANSFERS:
+        await asyncio.gather(*ACTIVE_TRANSFERS.values(), return_exceptions=True)
+    try:
+        if user_client.is_connected():
+            await user_client.disconnect()
+    except Exception:
+        pass
+    await bot.session.close()
+
+
+async def main() -> None:
+    await on_startup()
+    try:
+        await dp.start_polling(bot, handle_signals=True, polling_timeout=20, tasks_concurrency_limit=100)
+    finally:
+        await on_shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
