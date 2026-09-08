@@ -4,11 +4,12 @@ Voroa is a clean Telegram media transfer bot built specifically for HJ GROUPS.
 
 ## Architecture
 
-- `voroa_launcher.py` is the only production launcher.
+- `voroa_launcher.py` is the production launcher.
 - `voroa_stable.py` contains the bot runtime.
 - aiogram handles the bot UI, commands, buttons, and callbacks.
 - Telethon uses a Telegram user session for source access and Telegram-to-Telegram media transfer.
 - Core transfer does not depend on MongoDB, Playbook, or a separate downloader service.
+- Transfers pass Telegram media to Telethon directly; Voroa does not buffer the entire file in RAM.
 
 ## Main workflow
 
@@ -17,8 +18,20 @@ Voroa is a clean Telegram media transfer bot built specifically for HJ GROUPS.
 3. Scan one Telegram message link or a message-ID range.
 4. Review the files and total size.
 5. Press `Confirm Transfer`.
-6. Voroa starts the transfer as a background task and shows a live status message.
-7. A `Cancel Transfer` button is available while the job is active.
+6. Voroa creates a unique job and starts exactly one background transfer task.
+7. Source media are refreshed by message ID before sending.
+8. A `Cancel Transfer` button is available while the job is active.
+
+## Lifecycle safety
+
+- Confirmation and cancellation callbacks are bound to a unique job ID, so stale Telegram buttons cannot operate on a newer job.
+- Active job cleanup is identity-safe and cannot remove a newer transfer's state.
+- Login, logout, and Telegram session replacement are blocked while a transfer is active because the runtime uses one shared Telethon client.
+- Progress and heartbeat status tasks belong to the transfer lifecycle and are cleaned up before transfer state is removed.
+- Flood-wait sleeps are cancellation-aware and do not resume a retry after cancellation.
+- A single failed file is reported as a failed transfer rather than a normal success.
+- Saved destinations are snapshotted into the job and are authoritative for that job.
+- Access control is fail-closed: configure `TELEGRAM_ALLOWED_USER_IDS` and/or `VOROA_OWNER_USER_ID`.
 
 ## Supported controls
 
@@ -40,7 +53,7 @@ Copy `.env.example` into your deployment configuration and provide:
 - `TELEGRAM_API_HASH`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_SESSION_STRING` or a persistent session file
-- optional access-control IDs
+- access-control IDs
 - optional default destination
 
 Never commit a bot token, API hash, Telegram session, OTP, or 2FA password.
