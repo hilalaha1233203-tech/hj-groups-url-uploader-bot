@@ -1,1 +1,1 @@
-worker: python3 start_v2.py
+worker: python3 voroa_stable.py
