@@ -107,6 +107,7 @@ def menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🎯 Destination"), KeyboardButton(text="📋 Current Job")],
             [KeyboardButton(text="🔐 Login"), KeyboardButton(text="📱 Session")],
             [KeyboardButton(text="🚪 Logout"), KeyboardButton(text="❌ Cancel")],
+            [KeyboardButton(text="⚙️ Settings")],
             [KeyboardButton(text="ℹ️ Help")],
         ],
         resize_keyboard=True,
@@ -870,6 +871,103 @@ async def transfer_cancel(callback: CallbackQuery) -> None:
     await callback.answer("🛑 Cancelling…")
 
 
+async def settings_response(message: Message) -> None:
+    uid = message.from_user.id if message.from_user else 0
+    if not authorized(uid):
+        await message.answer("⛔ You are not authorized to use this bot.")
+        return
+    destination = get_destination(uid) or "Not set"
+    session = "Active" if load_session_string() else "Not logged in"
+    await message.answer(
+        "⚙️ <b>Settings</b>\\n\\n"
+        f"🎯 Destination: <code>{html.escape(destination)}</code>\\n"
+        f"📱 Telegram session: <b>{session}</b>\\n"
+        f"📦 Bulk message limit: <b>{MAX_BULK_MESSAGES}</b>\\n"
+        f"📁 Transfer file limit: <b>{MAX_TRANSFER_FILES}</b>\\n\\n"
+        "Use 🎯 Destination to change the target, or 🔐 Login to change the Telegram account.",
+        parse_mode="HTML", reply_markup=menu(),
+    )
+
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: Message) -> None:
+    await settings_response(message)
+
+
+@dp.message(F.text == "⚙️ Settings")
+async def button_settings(message: Message) -> None:
+    await settings_response(message)
+
+
+async def latest_features_response(message: Message) -> None:
+    uid = message.from_user.id if message.from_user else 0
+    if not authorized(uid):
+        await message.answer("⛔ You are not authorized to use this bot.")
+        return
+    await message.answer(
+        "🆕 <b>HJ GROUPS OF FILES — Latest Features</b>\\n\\n"
+        "🔗 Single Telegram message link scan\\n"
+        "📦 Bulk message-range scan\\n"
+        "🎯 Per-user destination\\n"
+        "🚀 Telegram-to-Telegram transfer\\n"
+        "📊 Live transfer progress\\n"
+        "🛑 Safe cancellation\\n"
+        "⏳ FloodWait-aware retry\\n"
+        "📋 Current job/status\\n"
+        "🔐 Telegram login + 2FA\\n"
+        "📱 Session status\\n"
+        "⚙️ Persistent Settings",
+        parse_mode="HTML", reply_markup=menu(),
+    )
+
+
+@dp.message(Command("features"))
+@dp.message(Command("latest"))
+@dp.message(Command("latest_update"))
+async def cmd_latest_features(message: Message) -> None:
+    await latest_features_response(message)
+
+
+@dp.message(Command("scan"))
+async def cmd_scan(message: Message) -> None:
+    await button_scan(message)
+
+
+@dp.message(Command("bulk"))
+async def cmd_bulk(message: Message) -> None:
+    await button_bulk(message)
+
+
+@dp.message(Command("destination"))
+async def cmd_destination(message: Message) -> None:
+    await button_destination(message)
+
+
+@dp.message(Command("job"))
+async def cmd_job(message: Message) -> None:
+    await button_job(message)
+
+
+@dp.message(Command("login"))
+async def cmd_login(message: Message) -> None:
+    await button_login(message)
+
+
+@dp.message(Command("session"))
+async def cmd_session(message: Message) -> None:
+    await button_session(message)
+
+
+@dp.message(Command("logout"))
+async def cmd_logout(message: Message) -> None:
+    await button_logout(message)
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message) -> None:
+    await button_cancel(message)
+
+
 @dp.message()
 async def text_router(message: Message) -> None:
     uid = message.from_user.id if message.from_user else 0
@@ -1050,8 +1148,19 @@ async def finalize_login(message: Message, uid: int) -> None:
 
 async def setup_commands() -> None:
     await bot.set_my_commands([
-        BotCommand(command="start", description="Open Voroa"),
+        BotCommand(command="start", description="Open HJ GROUPS OF FILES"),
         BotCommand(command="help", description="Show help"),
+        BotCommand(command="features", description="Show latest features"),
+        BotCommand(command="latest", description="Show latest update"),
+        BotCommand(command="settings", description="Open settings"),
+        BotCommand(command="scan", description="Scan one Telegram link"),
+        BotCommand(command="bulk", description="Scan a message range"),
+        BotCommand(command="destination", description="Set destination"),
+        BotCommand(command="job", description="Show current job"),
+        BotCommand(command="login", description="Login Telegram account"),
+        BotCommand(command="session", description="Show session status"),
+        BotCommand(command="logout", description="Logout Telegram account"),
+        BotCommand(command="cancel", description="Cancel current operation"),
     ])
 
 
